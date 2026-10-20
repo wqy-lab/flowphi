@@ -129,6 +129,66 @@ def movement_warnings(document):
     return result
 
 
+def hand_crossing_warnings(document):
+    """Report crossed hands: rare in Phigros, and the planner only prices them softly."""
+    from flowphi.motion import world_xy
+    profile = document.baseline['profile']
+    offsets = profile['fingers']
+    tolerance = .012 * profile.get('scale', .27) / .27
+    screen = document.baseline['physical_screen']
+
+    def anchor(c, when):
+        xy = world_xy(point_at(c['points'], when), screen)
+        side = -1 if c['hand'] == 'left' else 1
+        entry = offsets.get(f'{side}:{c["finger"]}')
+        return xy[0] - (entry['offset'][0] if entry else 0.)
+
+    bounds = {}
+
+    def range_x(c):
+        cached = bounds.get(id(c['points']))
+        if cached is not None and cached[0] is c['points']:
+            return cached[1], cached[2]
+        side = -1 if c['hand'] == 'left' else 1
+        entry = offsets.get(f'{side}:{c["finger"]}')
+        offset = entry['offset'][0] if entry else 0.
+        xs = [(p[1] - .5) * screen[0] - offset for p in c['points']]
+        bounds[id(c['points'])] = (c['points'], min(xs), max(xs))
+        return min(xs), max(xs)
+
+    contacts = sorted(((i, document.contact(i)) for i in range(len(document))),
+                      key=lambda item: item[1]['start'])
+    result = []
+    for position, (i, a) in enumerate(contacts):
+        for j, b in contacts[position + 1:]:
+            if b['start'] >= a['end']:
+                break
+            if a['hand'] == b['hand']:
+                continue
+            low, high = max(a['start'], b['start']), min(a['end'], b['end'])
+            if high - low <= 1e-9:
+                continue
+            left, right = (a, b) if a['hand'] == 'left' else (b, a)
+            if range_x(left)[1] - range_x(right)[0] <= tolerance:
+                continue
+            steps = max(2, min(16, int((high - low) / .02) + 2))
+            step = (high - low) / steps
+            worst, seconds, at = 0., 0., None
+            for n in range(steps):
+                when = min(high, low + (n + .5) * step)
+                depth = anchor(left, when) - anchor(right, when) - tolerance
+                if depth > 0:
+                    seconds += step
+                    if depth > worst:
+                        worst, at = depth, when
+            if not worst:
+                continue
+            result.append(issue('hand_crossing',
+                f'这里双手交叉约 {worst * 1000:.0f} mm 并持续 {seconds * 1000:.0f} msPhigros 很少需要反手，建议换手或调整长条的持指方式',
+                sorted({i, j}), at or low, 'warning'))
+    return result
+
+
 def validate(document, chart, *, geometry=True, progress=None, time_range=None, resolved=False):
     if not resolved:
         from flowphi.ui.model import PlanDocument
@@ -153,6 +213,8 @@ def validate(document, chart, *, geometry=True, progress=None, time_range=None, 
                 document.contact(i)['start'] < time_range[1] and document.contact(i)['end'] > time_range[0]]
     problems.extend(draft_warnings(document, selected))
     problems.extend(p for p in movement_warnings(document) if time_range is None or time_range[0] <= p['time'] < time_range[1])
+    problems.extend(p for p in hand_crossing_warnings(document)
+                    if time_range is None or time_range[0] <= p['time'] < time_range[1])
     if geometry:
         from flowphi.charts.model import NoteType
         from flowphi.planning.contacts import ContactGeometry, validate_contact

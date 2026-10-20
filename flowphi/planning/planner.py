@@ -85,6 +85,14 @@ class State:
 COMFORT = dict(index=5.5, middle=5., ring=3.6, thumb=3.2, little=2.8)
 PEAK = dict(index=13., middle=11., ring=8., thumb=7., little=6.)
 PREFERENCE = dict(index=0., middle=.18, ring=.5, thumb=.35, little=.65)
+# Crossed hands are rare in Phigros and read badly on camera. A distance check
+# misses them (crossed wrists are far apart), so the wrist order is sampled and
+# priced here: CROSS_WEIGHT per CROSS_UNIT of inversion beyond a tolerance that
+# lets the hands pass each other while fingers swap, ramped by duration.
+CROSS_TOLERANCE = .012
+CROSS_UNIT = .02
+CROSS_RAMP_SECONDS = .25
+CROSS_WEIGHT = 1.5
 
 
 def load_at(contacts, t, hand, finger=None, settings=None):
@@ -128,6 +136,7 @@ class Planner:
         self.corridor_paths = {}
         self.terminal_paths = {}
         self.judgement_times = {}
+        self._crossing_bounds = {}
         self.rejected = Counter()
         self.tasks = []
         for line in chart.lines:
@@ -211,6 +220,56 @@ class Planner:
         side = -1 if contact['hand'] == 'left' else 1
         offset = self.offset(side, contact['finger'])
         return xy[0] - offset[0], xy[1] - offset[1]
+
+    def _anchor_bounds(self, contact):
+        """Cached horizontal range of a contact's wrist anchors."""
+        cache = self._crossing_bounds
+        entry = cache.get(id(contact['points']))
+        if entry is not None and entry[0] is contact['points']:
+            return entry[1], entry[2]
+        side = -1 if contact['hand'] == 'left' else 1
+        offset = self.offset(side, contact['finger'])[0]
+        xs = [((p[1] - .5) * self.physical[0]) - offset for p in contact['points']]
+        bounds = (min(xs), max(xs))
+        if len(cache) > 4096:
+            cache.clear()
+        cache[id(contact['points'])] = (contact['points'], *bounds)
+        return bounds
+
+    def hand_crossing(self, record, contacts, low=None, high=None):
+        """Return (excess_m, seconds, at) while the left wrist is right of the right.
+
+        Sampling the anchor order is what catches a sustained crossing; the
+        distance checks in ``constraints`` only react to fingertips overlapping.
+        ``excess`` is how far the order is inverted beyond CROSS_TOLERANCE.
+        """
+        low = record['start'] if low is None else low
+        high = record['end'] if high is None else high
+        tolerance = CROSS_TOLERANCE * self.profile['scale'] / .27
+        excess, seconds, at = 0., 0., None
+        # Search histories are ordered by start, so only nearby contacts can overlap.
+        for other in reversed(contacts):
+            if other['start'] < low - .65:
+                break
+            if other['start'] > high or other['hand'] == record['hand']:
+                continue
+            start, stop = max(low, other['start']), min(high, other['end'])
+            if stop - start <= 1e-9:
+                continue
+            left, right = (record, other) if record['hand'] == 'left' else (other, record)
+            # Necessary condition on the whole polylines: skip pairs that cannot invert.
+            if self._anchor_bounds(left)[1] - self._anchor_bounds(right)[0] <= tolerance:
+                continue
+            steps = max(2, min(16, int((stop - start) / .02) + 2))
+            step = (stop - start) / steps
+            for i in range(steps):
+                when = min(stop, start + (i + .5) * step)
+                depth = self.anchor(left, when)[0] - self.anchor(right, when)[0] - tolerance
+                if depth > 0:
+                    seconds += step
+                    if depth > excess:
+                        excess, at = depth, when
+        return excess, seconds, at
 
     def seeds(self, task, state, side, finger):
         w, h = self.screen.width, self.screen.height

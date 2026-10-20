@@ -8,7 +8,8 @@ from flowphi.motion import world_xy
 
 
 def score_contact(planner, record, history, movement, posture, violations):
-    from flowphi.planning.planner import COMFORT, PREFERENCE, load_at
+    from flowphi.planning.planner import (CROSS_RAMP_SECONDS, CROSS_UNIT, CROSS_WEIGHT,
+                                          COMFORT, PREFERENCE, load_at)
     settings = planner.settings
     hand, finger, t = record['hand'], record['finger'], record['start']
     previous = next((c for c in reversed(history) if (c['hand'], c['finger']) == (hand, finger)), None)
@@ -35,17 +36,24 @@ def score_contact(planner, record, history, movement, posture, violations):
     # DOWNs merely because a later postprocessor might join them.
     travel = sum(math.dist(world_xy(a[1:], planner.physical), world_xy(b[1:], planner.physical))
                  for a, b in zip(record['points'], record['points'][1:]))
+    # Crossed hands are rare in Phigros: price the wrist-order inversion instead
+    # of relying on fingertip distance alone, which a sustained crossing avoids.
+    excess, crossed_seconds, crossed_at = planner.hand_crossing(record, history)
+    crossing = 0. if not excess else CROSS_WEIGHT * (excess / CROSS_UNIT) * (
+        1. + crossed_seconds / CROSS_RAMP_SECONDS)
     costs = dict(preference=PREFERENCE[finger], fatigue=.8*f+1.5*max(0., af-f),
         burst=2*record['burst_cost']+.2*(1-ab), hand=.6*hf+.3*(1-hb),
         movement=.35*movement + (.15*(travel/.1)**2 if any(
             planner.original_tasks[n].note.type == NoteType.DRAG for n in record['note_ids']) else 0.),
         posture=.8*posture, visual=(along/planner.screen.width)**2*80,
-        side=max(0., -.03-side*(x-.5))**2*12, habit=-habit, degraded=1000.*len(violations))
+        side=max(0., -.03-side*(x-.5))**2*12, habit=-habit, crossing=crossing,
+        degraded=1000.*len(violations))
     if settings.fingering_objective == 'load':
-        for name in ('preference', 'movement', 'posture', 'visual', 'side', 'habit', 'degraded'):
+        for name in ('preference', 'movement', 'posture', 'visual', 'side', 'habit', 'crossing', 'degraded'):
             costs[name] = 0.
     record['decision'] = dict(costs=costs, fatigue_before=f, fatigue_after=af,
-        burst_before=b, burst_after=ab, hand_fatigue=hf, finger_cps=cps, degraded=list(violations))
+        burst_before=b, burst_after=ab, hand_fatigue=hf, finger_cps=cps, degraded=list(violations),
+        crossing=dict(excess_m=excess, seconds=crossed_seconds, at=crossed_at) if excess else None)
     return sum(costs.values())
 
 
