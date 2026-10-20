@@ -15,6 +15,7 @@ PREFERENCES = {
     'generator_fingers': ('all', ['index', 'index_middle', 'all']),
     'fingering_objective': ('balanced', ['balanced', 'load']),
     'speed_limits': (True,), 'judgement_windows': (False,), 'keep_unplanned': (True,),
+    'drag_ribbon_planning': (True,),
     'clip_resolution': ('640x360', ['640x360', '1280x720', '1920x1080']),
     'render_resolution': ('1280x720', ['640x360', '1280x720', '1920x1080']),
     'clip_fps': (30, [15, 30, 60]), 'render_fps': (30, [15, 30, 60]),

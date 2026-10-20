@@ -411,6 +411,10 @@ class GenerateDialog(QDialog):
         self.windows.setChecked(settings.get('judgement_windows', False))
         self.windows.setToolTip('让手指在方案允许的判定时间范围内略微提前或延后击打；原谱面的音符时间保持')
         form.addRow('', self.windows)
+        self.ribbons = QCheckBox('黄键长条整体规划')
+        self.ribbons.setChecked(settings.get('drag_ribbon_planning', True))
+        self.ribbons.setToolTip('比较连划、分段接力和多指驻点，结合夹键择优；效果优先，生成可能更慢')
+        form.addRow('', self.ribbons)
         self.beam = spin(settings.get('solver_beam', 8), 1, 32)
         self.beam.setToolTip('算法每一步保留多少种分配方案继续尝试数值越大，通常越慢；不保证一定能找到结果')
         form.addRow('每步保留方案数', self.beam)
@@ -428,6 +432,7 @@ class GenerateDialog(QDialog):
                     keep_unplanned=self.keep_unplanned.isChecked(),
                     settings=dict(fingers=self.fingers.currentData(), fingering_objective=self.mode.currentData(),
                                   speed_limits=self.speed.isChecked(), judgement_windows=self.windows.isChecked(),
+                                  drag_ribbon_planning=self.ribbons.isChecked(),
                                   beam_width=self.beam.value(), candidates_per_finger=self.candidates.value()))
 
 

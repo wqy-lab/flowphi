@@ -80,21 +80,10 @@ def load_inputs(request):
 
 
 def validate_export(document, source, *, time_range=None):
-    from flowphi.ui.compiler import compile_plan
-    from flowphi.ui.validation import quick_check, validate
-    problems = quick_check(document, chart=source.chart, time_range=time_range)
-    if problems:
-        return dict(valid=False, issues=problems, geometry_checked=False)
-    event('编译触控数据', stage='compile')
-    raw, plan = compile_plan(document, source.chart, time_range=time_range, check=True)
-    canonical = PlanDocument(plan, chart=source.reference, copy_baseline=False, allow_empty=True)
+    from flowphi.services.candidates import validate_compiled
     event('检查触控判定', stage='validate', detail='检查手指占用、判定区域和 Hold 连续性')
-    report = validate(canonical, source.chart, time_range=time_range, resolved=True,
-                      progress=lambda done, total: event('检查判定区域', stage='validate', done=done, total=total, unit='段动作'))
-    for problem in report['issues']:
-        problem['contacts'] = sorted({j for i in problem['contacts'] for j in plan['contacts'][i]['editor_contacts']})
-    report['validated_psap_sha256'] = hashlib.sha256(raw).hexdigest()
-    return report
+    return validate_compiled(document, source.chart, time_range=time_range,
+        progress=lambda done, total: event('检查判定区域', stage='validate', done=done, total=total, unit='段动作'))
 
 
 def execute(request):
@@ -122,6 +111,12 @@ def execute(request):
         event('生成指法初稿', stage='plan')
         def planning_progress(done, total, task):
             detail = f'当前音符 {task.id} · {task.beat / 1000:.3f} s' if task else '全部音符已处理'
+            phrase = getattr(task, 'planning_detail', None)
+            if phrase:
+                names = dict(baseline='逐颗兜底', heads='夹键分配', continuous='连续划动', relay='分段接力', stationary='多指驻点')
+                detail = (f'黄键长条 {phrase["start"]:.3f}–{phrase["end"]:.3f} s · '
+                          f'{names[phrase["strategy"]]} {phrase["done"]}/{phrase["total"]} · '
+                          f'已用 {phrase["elapsed_seconds"]:.1f} s')
             event('生成指法初稿', stage='plan', done=done, total=total, unit='个音符', detail=detail)
         console = Console(force_terminal=False, color_system=None)
         if options.get('keep_unplanned', True):
@@ -140,6 +135,14 @@ def execute(request):
         return dict(project=str(project), contacts=len(document), chart=source.reference)
     document, source = load_inputs(request)
     report_log(f"谱面：{source.reference['path']} · {source.reference['note_count']} 个音符 · {len(document)} 段动作")
+    if kind == 'evaluate_candidate':
+        from flowphi.services.candidates import evaluate_candidate
+        event('评估候选打法', stage='candidate', detail='在副本上试改，完整检查原方案与候选方案')
+        return evaluate_candidate(document, source.chart, request.get('operations', []),
+            offset=request.get('offset', 0.), selected_ids=request.get('selected_ids', []),
+            fallback_range=request.get('fallback_range'),
+            progress=lambda done, total: event('检查候选判定区域', stage='candidate.validate',
+                                               done=done, total=total, unit='段动作'))
     if kind == 'replan':
         from flowphi.ui.optimise import reassign
         event('重新分配手指', stage='replan', detail=f"已选 {len(request['selected'])} 段动作；跳过已锁定的指法")

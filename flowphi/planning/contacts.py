@@ -16,7 +16,7 @@ from flowphi.motion import point_at
 
 class ContactGeometry:
     def __init__(self, chart, mask_size=(196, 110), pad_clearance=.006, boundary_mode='aligned',
-                 physical_screen=(.28, .1575), extra_clearance_m=0.):
+                 physical_screen=(.28, .1575), extra_clearance_m=0., cache_judgement=False):
         self.chart = chart
         self.notes = dict(enumerate((line, n) for line in chart.lines for n in line.notes))
         self.screen = box(.012, .012, .988, .988).difference(
@@ -33,6 +33,13 @@ class ContactGeometry:
             raise ValueError('Block clearance must be finite and nonnegative')
         if len(self.physical_screen) != 2 or any(not math.isfinite(v) or v <= 0 for v in self.physical_screen):
             raise ValueError('Physical screen dimensions must be finite and positive')
+        # A planner owns an immutable chart. Bound caches to this geometry's
+        # lifetime; final export validation uses the independent uncached path.
+        self.cache_judgement = cache_judgement
+        if cache_judgement:
+            self._strip_at = lru_cache(maxsize=8192)(self._strip_at)
+            self._required_zone = lru_cache(maxsize=4096)(self._required_zone)
+            self._guarded_zone = lru_cache(maxsize=4096)(self._guarded_zone)
 
     def normalized(self, geometry):
         return scale(geometry, xfact=1 / self.chart.width, yfact=1 / self.chart.height, origin=(0, 0))
@@ -64,13 +71,34 @@ class ContactGeometry:
         return contact.get('judgement_times', {}).get(str(nid), self.notes[nid][1].seconds)
 
     def strip(self, line, note, t, ratio, judgement_time=None):
+        return self._strip_at(line, note, self._strip_time(note, t, judgement_time), ratio)
+
+    @staticmethod
+    def _strip_time(note, t, judgement_time):
         when = max(note.seconds, min(t, note.seconds + note.hold - .001)) if note.type == NoteType.HOLD else (
             note.seconds if judgement_time is None else judgement_time)
+        return when
+
+    def _strip_at(self, line, note, when, ratio):
         half = JUDGE_HALF_DRAG if note.type in (NoteType.DRAG, NoteType.FLICK) else JUDGE_HALF_TAP
         return self.normalized(JudgeArea(line.pos(when, note.offset),
             cmath.exp(1j * (line.angle @ when)), self.chart.width, self.chart.height, half, ratio).poly)
 
-    def zone(self, contact, t, *, central=True, include_blocks=True):
+    def _required_zone(self, specs, joint):
+        strips = [self._strip_at(*spec) for spec in specs]
+        zone = self.screen
+        if joint:
+            for strip in strips:
+                zone = zone.intersection(strip)
+        else:
+            zone = zone.intersection(unary_union(strips))
+        return zone
+
+    @staticmethod
+    def _guarded_zone(zone):
+        return zone.buffer(1e-9)
+
+    def _required(self, contact, t):
         joint = contact.get('joint_note_coverage') or any(
             w['start'] <= t < w['end'] for w in contact.get('joint_note_windows', ()))
         owner = [(*self.notes[nid], self.judgement_time(contact, nid)) for nid in contact['note_ids']]
@@ -85,6 +113,38 @@ class ContactGeometry:
         if joint:
             required = holds + [(line, n, beat) for line, n, beat in owner if n.type != NoteType.HOLD and
                 (abs(t - beat) <= .0011 or beat <= t <= beat + .010)]
+        return required, joint
+
+    def _interior_point(self, contact, t, xy):
+        """Sufficient interior test for rectangles, with a numerical guard.
+
+        Boundary points and authored region restrictions take the exact polygon
+        path. Block clearance is always checked separately by allows_point.
+        """
+        if contact.get('refinement_region'):
+            return False
+        x, y = xy
+        guard = 1e-7
+        if not (.012 + guard < x < .988 - guard and .012 + guard < y < .988 - guard):
+            return False
+        if y <= .1 + guard and (x <= .1 + guard or x >= .9 - guard):
+            return False
+        required, joint = self._required(contact, t)
+        point = complex(x * self.chart.width, y * self.chart.height)
+        margin = guard * max(self.chart.width, self.chart.height)
+        def inside(item):
+            line, note, beat = item
+            when = self._strip_time(note, t, beat)
+            center = line.pos(when, note.offset)
+            delta = (point - center) * cmath.exp(-1j * (line.angle @ when))
+            half = JUDGE_HALF_DRAG if note.type in (NoteType.DRAG, NoteType.FLICK) else JUDGE_HALF_TAP
+            ratio = .5 if note.type in (NoteType.HOLD, NoteType.TAP) else .3 if note.type == NoteType.DRAG else .85
+            return (abs(delta.real) < self.chart.width * half * ratio - margin and
+                    abs(delta.imag) < math.hypot(self.chart.width, self.chart.height) + abs(center) - margin)
+        return not required or (all(map(inside, required)) if joint else any(map(inside, required)))
+
+    def zone(self, contact, t, *, central=True, include_blocks=True):
+        required, joint = self._required(contact, t)
         # A connected Drag phrase is free to travel BETWEEN judgement windows.
         # Switching the nearest note's strip at its temporal midpoint creates
         # spurious discontinuities, even while the actual note geometry is static.
@@ -94,14 +154,19 @@ class ContactGeometry:
         if contact.get('refinement_region'):
             zone = zone.intersection(box(*contact['refinement_region']))
         if required:
-            strips = [self.strip(line, n, t, (.5 if n.type in (NoteType.HOLD, NoteType.TAP) else
-                      .3 if n.type == NoteType.DRAG else .85) if central else .85, beat)
-                      for line, n, beat in required]
-            if joint:
-                for strip in strips:
-                    zone = zone.intersection(strip)
+            specs = tuple((line, n, self._strip_time(n, t, beat),
+                (.5 if n.type in (NoteType.HOLD, NoteType.TAP) else
+                 .3 if n.type == NoteType.DRAG else .85) if central else .85)
+                for line, n, beat in required)
+            if self.cache_judgement and not contact.get('refinement_region'):
+                zone = self._required_zone(specs, bool(joint))
             else:
-                zone = zone.intersection(unary_union(strips))
+                strips = [self._strip_at(*spec) for spec in specs]
+                if joint:
+                    for strip in strips:
+                        zone = zone.intersection(strip)
+                else:
+                    zone = zone.intersection(unary_union(strips))
         if include_blocks and self.chart.block_areas:
             blocked = self.blocked(t, contact.get('block_clearance_m'))
             if not blocked.is_empty:
@@ -109,8 +174,8 @@ class ContactGeometry:
         return zone
 
     def allows_point(self, contact, t, xy):
-        point = Point(*xy)
-        if not self.zone(contact, t, include_blocks=False).buffer(1e-9).covers(point):
+        interior = self.cache_judgement and self._interior_point(contact, t, xy)
+        if not interior and not self._guarded_zone(self.zone(contact, t, include_blocks=False)).covers(Point(*xy)):
             return False
         clearance = contact.get('block_clearance_m', self.extra_clearance_m)
         radius = self.display_margin / math.cos(math.pi / 64)
@@ -126,7 +191,7 @@ class ContactGeometry:
         if not nearby:
             return True
         blocked = self.blocked_rectangles(tuple(nearby), clearance)
-        return not blocked.buffer(-1e-9).covers(point)
+        return not blocked.buffer(-1e-9).covers(Point(*xy))
 
     def times(self, contact, step=.01):
         low, high = round(contact['start'] * 1000), round(contact['end'] * 1000) - 1

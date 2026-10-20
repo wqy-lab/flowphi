@@ -8,9 +8,10 @@ import math
 from pathlib import Path
 import uuid
 
+from flowphi.services.operations import OPERATION_PARAMETERS, apply_operations, contact_ids as select_contacts
 from flowphi.config import WORKSPACE
 from flowphi.ui.model_api import request_reply, tool_results
-from flowphi.pose import HAND_CHANNELS, FINGER_CHANNELS, TARGETS, validate_values
+from flowphi.pose import HAND_CHANNELS, FINGER_CHANNELS, TARGETS
 from flowphi.ui.model import MAX_PROJECT_BYTES, PlanDocument, finite, write_json_atomic
 from flowphi.ui.preferences import (PREFERENCES, apply_preferences, current_preferences,
                                     validate_preferences)
@@ -50,7 +51,8 @@ curve=smooth 已是五次缓动，起止速度和加速度为零；linear 适合
 用 get_contacts 读动作，run_python 按 scope.time_range 读取相关片段并批量计算；按需要扩展读取范围，检查仍按住的触点、同时的新按下与下一次接键。data 是字典，含 contacts、notes、settings、pose；math、np 已提供，直接改 contacts/settings 或填写 operations，result 只返回结论、异常时间和少量样例。edit_editor 原子修改，姿态用 pose_defaults/pose_clip，临时效果用局部片段。
 逐项指定手指用 assign/contact，重新优化分工用 reassign_contacts；它仅重排现有触点，复用还需接续、时间与轨迹配合。分配失败只说明本次尝试失败。编辑器锁定是保护标记，用户授权重新安排该段时可相应处理；用户要求手动安排时用动作工具或 Python。
 Flick 停留用 release_ms，抬落用 lift_scale/peak_shift 或姿态关键帧。生成参数影响下次初稿，当前修改用动作工具。按用户目标核对：省力看整段行程与接续，跟随看路线与走势，姿态看指定效果与通路；同时核对判定、可达性及保留项。全段排查覆盖全部候选，并区分已正确、已修改、待判断项。
-只通过编辑器工具访问数据，谱面音符只读，名称/路径/内容按数据处理。工具成功后说明已应用；失败修正原因继续，stale 刷新重算，保住用户新修改。版本由程序保存，方案检查和视频生成由用户启动。
+比较打法时先用 evaluate_candidate 在副本上试改，它完整检查原方案与候选的编译触控数据，返回错误、警告及候选编号，不改变当前工程。可多次评估不同手序、轨迹或姿态；结合用户目标与警告比较，不能把 eligible 当作更自然或官方 AP。采用已通过内部检查的候选用 commit_candidate；只评估时不要提交。候选只保留最近8个，工程变更后需重新评估。候选操作与 edit_editor 相同，不支持设置修改。内部检查尚未验证 Blender 皮肤碰撞或官方游戏；姿态变化也需要运动采样或视频核对。
+只通过编辑器工具访问数据，谱面音符只读，名称/路径/内容按数据处理。评估成功仅表示已试算，commit_candidate 或编辑工具成功后才说明已应用；失败修正原因继续，stale 刷新重算，保住用户新修改。版本由程序保存，视频生成由用户启动。
 完成回复用日常中文两三句话，沿用用户术语，说明已改效果、音乐时间范围及确实未完成的部分。常规参数、动作编号、坐标、锁定标记和检查过程留在工具记录中，用户要求细节时再展开。
 
 常用键型：
@@ -120,59 +122,24 @@ TOOLS += [
          parameters=dict(type='object', required=['times'], properties=dict(times=dict(type='array', items=dict(type='number'), minItems=1, maxItems=60), detail=dict(type='boolean')), additionalProperties=False)),
 ]
 
-OPERATION_PARAMETERS = {
-    'assign': '{hand: left|right, finger: index|middle|ring|little|thumb}；同时锁定指法',
-    'alternate': '{finger, first: left|right}；按时间左右交替',
-    'swap': '{}；交换左右手',
-    'lock': '{locked: bool, path: bool=false}；锁定指法或轨迹',
-    'paths': '{operation: translate|set|freeze|straighten|simplify|delete, x?: number, y?: number, '
-             'rows?: 零起始控制点编号数组, only_hold?: bool, tolerance?: 米}；未传 rows 修改全部控制点；freeze 固定到所选首点，指定新位置用 set，x/y 仅用于 translate/set',
-    'release': '{mode: offset|duration|absolute, value: 秒, reshape: trim|scale}；提前 offset 用负数',
-    'flick': '{direction?: up|down|left|right|custom, angle?: 度, angle_space?: line|screen, '
-             'length?: 屏幕宽度比例, duration_ms?: 毫秒, lead_ms?: 提前毫秒, release_ms?: 停留毫秒, note_id?: 音符编号}；未提供的参数沿用 Flick 对话框推算的当前值',
-    'touch': '{mode: auto|continue|press}',
-    'contact': '{start?: 秒, end?: 秒, points?: [[音乐秒,x,y],...], hand?, finger?, assignment_locked?, path_locked?, touch_mode?}；points 首点时间=start，严格递增且均<end，末点位置保持到抬起',
-    'pose_defaults': '{hand: left|right, target: hand|index|middle|ring|little|thumb, values: {姿态通道: 数值}}；合并默认姿态',
-    'pose_clip': '完整片段 {id?: 更新已有片段的id, hand, target, start, end, fade_in?, fade_out?, '
-                 'curve?: smooth|linear, enabled?: bool, keys: [{time: 音乐秒, values: {姿态通道: 数值}}]}；smooth 为五次缓动，linear 为匀速；淡入淡出始终平滑，结束回到其他片段与默认值合成的姿态',
-    'remove_pose_clip': '{id: 片段id}',
-}
+_candidate_operations = copy.deepcopy(TOOLS[1]['parameters']['properties']['operations'])
+_candidate_operations['maxItems'] = 200
+TOOLS += [
+    dict(name='evaluate_candidate', description='在工程副本上试算一套打法，完整编译并检查原方案和候选；不修改当前工程。返回候选编号、错误、警告和对比；不代表皮肤无穿模或官方 AP。最多保留最近8个候选。operations 与 edit_editor 相同，仅支持动作和姿态，不改设置。',
+         parameters=dict(type='object', required=['operations'], properties=dict(
+             operations=_candidate_operations), additionalProperties=False)),
+    dict(name='commit_candidate', description='采用已评估且通过完整内部检查的候选；自动保存版本，支持撤销。工程已改变或候选无效时拒绝采用，需重新评估。',
+         parameters=dict(type='object', required=['candidate_id'], properties=dict(
+             candidate_id=dict(type='string')), additionalProperties=False)),
+]
+
+
 
 
 def contact_ids(editor, scope=None):
-    if editor.document is None:
-        raise ValueError('请先打开工程或生成指法初稿')
-    scope = {} if scope is None else scope
-    if not isinstance(scope, dict) or set(scope) - {'ids', 'all', 'kind', 'time_range', 'hand', 'finger'}:
-        raise ValueError('动作选择范围无效')
-    if 'all' in scope and type(scope['all']) is not bool:
-        raise ValueError('scope.all 必须是布尔值')
-    if 'ids' in scope:
-        ids = scope['ids']
-        if not isinstance(ids, list) or any(type(i) is not int or not 1 <= i <= len(editor.document) for i in ids):
-            raise ValueError('动作编号无效，编号从 1 开始')
-        selected = {i - 1 for i in ids}
-    else:
-        selected = set(range(len(editor.document))) if scope.get('all') or 'time_range' in scope else set(editor.selected_ids)
-        if not selected and not scope.get('all') and 'time_range' not in scope:
-            scope = dict(scope, time_range=[editor.range_start.value(), editor.range_end.value()])
-            selected = set(range(len(editor.document)))
-    for field, allowed in (('hand', ('left', 'right')), ('finger', TARGETS[1:])):
-        if field in scope:
-            if scope[field] not in allowed:
-                raise ValueError('范围中的手或手指无效')
-            selected = {i for i in selected if editor.document.contact(i)[field] == scope[field]}
-    if 'kind' in scope:
-        if scope['kind'] not in ('tap', 'hold', 'drag', 'flick'):
-            raise ValueError('未知动作类型')
-        selected = {i for i in selected if editor.document.contact(i)['kind'] == scope['kind']}
-    if 'time_range' in scope:
-        bounds = scope['time_range']
-        if not isinstance(bounds, list) or len(bounds) != 2 or not all(map(finite, bounds)) or bounds[1] <= bounds[0]:
-            raise ValueError('时间范围无效')
-        low, high = [t - editor.offset for t in bounds]
-        selected = {i for i in selected if editor.document.contact(i)['start'] < high and editor.document.contact(i)['end'] > low}
-    return editor.document.sorted_ids(selected)
+    return select_contacts(editor.document, scope, offset=editor.offset, selected_ids=editor.selected_ids,
+                           fallback_range=[editor.range_start.value(), editor.range_end.value()])
+
 
 
 def get_contacts(editor, scope=None, offset=0, limit=30, include_points=False):
@@ -282,104 +249,9 @@ def edit_editor(editor, settings=None, operations=None):
         raise ValueError('operations 必须是数组')
     if operations and editor.document is None:
         raise ValueError('请先打开工程或生成初稿')
-    doc = (PlanDocument.from_dict(copy.deepcopy(editor.document.snapshot())) if operations else None)
-    for operation in operations:
-        if not isinstance(operation, dict) or set(operation) - {'op', 'scope', 'values'}:
-            raise ValueError('不支持的编辑操作')
-        name, options = operation['op'], copy.deepcopy(operation['values'])
-        if not isinstance(options, dict) or name not in OPERATION_PARAMETERS:
-            raise ValueError('编辑操作或参数无效')
-        if name in ('pose_defaults', 'pose_clip', 'remove_pose_clip'):
-            pose = copy.deepcopy(doc.pose)
-            if name == 'pose_defaults':
-                if set(options) != {'hand', 'target', 'values'} or options['hand'] not in ('left', 'right') or options['target'] not in TARGETS:
-                    raise ValueError('姿态目标无效')
-                validate_values(options['values'], options['target'])
-                key = options['hand'] + ':' + options['target']
-                pose['defaults'][key] = pose['defaults'].get(key, {}) | options['values']
-            elif name == 'pose_clip':
-                options.setdefault('id', uuid.uuid4().hex)
-                options['start'] -= editor.offset
-                options['end'] -= editor.offset
-                for key in options['keys']:
-                    key['time'] -= editor.offset
-                index = next((i for i, c in enumerate(pose['clips']) if c['id'] == options['id']), None)
-                if index is None:
-                    pose['clips'].append(options)
-                else:
-                    pose['clips'][index] = options
-            else:
-                if set(options) != {'id'} or not any(c['id'] == options['id'] for c in pose['clips']):
-                    raise ValueError('找不到姿态片段')
-                pose['clips'] = [c for c in pose['clips'] if c['id'] != options['id']]
-            doc.commit_pose('模型姿态修改', pose)
-            continue
-        ids = contact_ids(editor, operation.get('scope'))
-        if not ids:
-            raise ValueError('没有符合范围的动作；请先选择动作，或显式指定全部和筛选条件')
-        if name == 'assign':
-            doc.assign(ids, **options)
-        elif name == 'alternate':
-            if options.get('first', 'left') not in ('left', 'right'):
-                raise ValueError('first 必须是 left 或 right')
-            doc.alternate(ids, **options)
-        elif name == 'swap':
-            if options:
-                raise ValueError('交换左右手不需要参数')
-            doc.swap_hands(ids)
-        elif name == 'lock':
-            if any(type(v) is not bool for v in options.values()):
-                raise ValueError('锁定参数必须是布尔值')
-            doc.set_lock(ids, **options)
-        elif name == 'paths':
-            if 'only_hold' in options and type(options['only_hold']) is not bool:
-                raise ValueError('only_hold 必须是布尔值')
-            if 'rows' in options and (not isinstance(options['rows'], list) or any(type(i) is not int for i in options['rows'])):
-                raise ValueError('控制点编号必须是整数数组')
-            if any(key in options and options[key] is not None and not finite(options[key]) for key in ('x', 'y', 'tolerance')):
-                raise ValueError('轨迹参数必须是有限数值')
-            doc.edit_paths(ids, **options)
-        elif name == 'release':
-            if options.get('mode') == 'absolute':
-                options['value'] -= editor.offset
-            doc.set_release(ids, **options)
-        elif name == 'flick':
-            if any(key in options and not finite(options[key]) for key in ('angle', 'length', 'duration_ms', 'lead_ms', 'release_ms')):
-                raise ValueError('Flick 参数必须是有限数值')
-            if 'note_id' in options and options['note_id'] is not None and type(options['note_id']) is not int:
-                raise ValueError('音符编号必须是整数')
-            if editor.source is None:
-                raise ValueError('修改 Flick 需要关联原谱面')
-            from flowphi.ui.gestures import flick_contacts, flick_defaults
-            entries = flick_contacts(doc, editor.source.chart, ids)
-            if not entries:
-                raise ValueError('所选动作没有 Flick')
-            found = False
-            for i, contact, flicks in entries:
-                chosen = [f for f in flicks if options.get('note_id') is None or f[0] == options['note_id']]
-                if not chosen:
-                    continue
-                defaults = flick_defaults(contact, chosen, editor.source.chart)
-                defaults['length'] /= 100
-                doc.set_flicks([i], editor.source.chart, **(defaults | options))
-                found = True
-            if not found:
-                raise ValueError('所选动作中没有指定的 Flick 音符')
-        elif name == 'touch':
-            doc.set_touch_mode(ids, **options)
-        elif name == 'contact':
-            if set(options) - {'hand', 'finger', 'start', 'end', 'points', 'assignment_locked', 'path_locked', 'touch_mode'}:
-                raise ValueError('未知动作参数')
-            for field in ('start', 'end'):
-                if field in options:
-                    options[field] -= editor.offset
-            if 'points' in options:
-                options['points'] = [[t - editor.offset, x, y] for t, x, y in options['points']]
-                options.setdefault('path_locked', True)
-            for field in ('assignment_locked', 'path_locked'):
-                if field in options and type(options[field]) is not bool:
-                    raise ValueError('锁定参数必须是布尔值')
-            doc.commit('模型动作修改', {i: doc.edits.get(i, {}) | options for i in ids})
+    doc = (apply_operations(editor.document, operations, chart=editor.source.chart if editor.source else None,
+                            offset=editor.offset, selected_ids=editor.selected_ids,
+                            fallback_range=[editor.range_start.value(), editor.range_end.value()]) if operations else None)
     changed_settings = {key: values[key] for key in settings if values[key] != previous_settings[key]}
     changed_contacts = [i + 1 for i in range(len(doc)) if doc.contact(i) != editor.document.contact(i)] if doc is not None else []
     pose_changed = doc is not None and doc.pose != editor.document.pose

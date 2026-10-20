@@ -10,7 +10,8 @@ from PySide6.QtWidgets import QTextBrowser
 
 
 TOOL_NAMES = {'get_contacts': '读取动作', 'edit_editor': '修改方案', 'run_python': '计算并整理动作',
-              'reassign_contacts': '重新安排手指', 'sample_motion': '查看手部位置'}
+              'reassign_contacts': '重新安排手指', 'sample_motion': '查看手部位置',
+              'evaluate_candidate': '评估候选打法', 'commit_candidate': '采用候选打法'}
 TIME = re.compile(r'(?<![\w.:])(?:\d{1,3}:[0-5]\d(?:\.\d{1,3})?|'
                   r'\d+(?:\.\d+)?(?=\s*(?:秒|s\b))|'
                   r'\d+(?:\.\d+)?(?=\s*[–—~～至-]\s*\d+(?:\.\d+)?\s*(?:秒|s\b)))(?![\d.:])')

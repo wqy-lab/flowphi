@@ -19,6 +19,7 @@ from flowphi.ui.model import write_json_atomic
 from flowphi.ui.model_api import (StreamReply, build_request, compaction_input,
     compaction_tail, estimate_tokens, parse_reply, tool_results, wire_messages)
 from flowphi.ui.preferences import current_preferences
+from flowphi.services.candidates import CandidateStore
 
 
 class PromptEdit(QPlainTextEdit):
@@ -40,6 +41,7 @@ class ModelEditPanel(QWidget):
     def __init__(self, editor):
         super().__init__(editor)
         self.editor = editor
+        self.candidates = CandidateStore()
         self.messages, self.pending = [], []
         self.reply = None
         self.active = False
@@ -470,7 +472,7 @@ class ModelEditPanel(QWidget):
                 value['scope'] = self.scope | scope
         if call['name'] in ('get_contacts', 'run_python', 'reassign_contacts'):
             scope_default(args)
-        elif call['name'] == 'edit_editor':
+        elif call['name'] in ('edit_editor', 'evaluate_candidate'):
             for operation in args.get('operations', []):
                 scope_default(operation)
         return args
@@ -523,6 +525,31 @@ class ModelEditPanel(QWidget):
                 prefs = current_preferences(self.editor)
                 self.jobs.start('replan', self.candidate, selected=ids, hands=args.get('hands'), fingers=args.get('fingers'),
                                 beam_width=prefs['replan_beam'], max_contacts=max(prefs['replan_contacts'], len(self.candidate)))
+            elif name == 'evaluate_candidate':
+                if set(args) != {'operations'}:
+                    raise ValueError('候选评估只接受 operations')
+                if self.editor.document is None or self.editor.source is None:
+                    raise ValueError('请先打开谱面并生成指法初稿')
+                self.candidate_revision = self.editor.document.revision
+                self.candidate_offset = self.editor.offset
+                self.jobs.start('evaluate_candidate', self.editor.document,
+                    operations=args['operations'], offset=self.candidate_offset,
+                    selected_ids=list(self.editor.selected_ids),
+                    fallback_range=[self.editor.range_start.value(), self.editor.range_end.value()])
+            elif name == 'commit_candidate':
+                if set(args) != {'candidate_id'}:
+                    raise ValueError('采用候选需要 candidate_id')
+                document, result = self.candidates.prepare_commit(args['candidate_id'], self.editor.document,
+                                                                 offset=self.editor.offset)
+                from flowphi.services.candidates import fingerprint
+                changed = fingerprint(document) != fingerprint(self.editor.document)
+                if changed:
+                    version = save_version(self.editor, '采用候选打法前')
+                    self.editor._changed(self.editor.document.replace_plan(document, '采用候选打法'))
+                    result['version'] = version.name
+                self.candidates.discard(args['candidate_id'])
+                result.update(changed=changed, contacts=result.pop('changed_contacts'))
+                self.finish_tool(result)
             else:
                 self.finish_tool(execute_tool(self.editor, name, args))
         except Exception as exc:
@@ -538,7 +565,12 @@ class ModelEditPanel(QWidget):
             if not message.get('ok'):
                 raise ValueError(message.get('error') or '计算已取消或超过 60 秒')
             result = message['result']
-            if self.current_call['name'] == 'run_python':
+            if self.current_call['name'] == 'evaluate_candidate':
+                if self.editor.offset != self.candidate_offset:
+                    raise ValueError('stale：音乐偏移已改变，请重新评估')
+                applied = self.candidates.remember(result, self.editor.document,
+                    revision=self.candidate_revision, offset=self.candidate_offset)
+            elif self.current_call['name'] == 'run_python':
                 args = dict(settings=result['settings'], operations=result['operations'])
                 args = self.arguments(dict(name='edit_editor', arguments=args))
                 applied = edit_editor(self.editor, **args)
@@ -558,6 +590,8 @@ class ModelEditPanel(QWidget):
         title = TOOL_NAMES.get(self.current_call['name'], '处理动作')
         if result.get('error'):
             title += ' · ' + error_summary(result['error'])
+        elif self.current_call['name'] == 'evaluate_candidate' and 'eligible' in result:
+            title += ' · 可采用' if result['eligible'] else ' · 未通过检查'
         elif result.get('changed') or result.get('changed_contacts'):
             count = len(result.get('contacts', [])) or result.get('changed_contacts', 0)
             title += f' · 已修改 {count} 段动作' if count else ' · 设置已更新'

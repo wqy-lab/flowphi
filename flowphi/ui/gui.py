@@ -274,13 +274,26 @@ class EditorWindow(QMainWindow):
         pose_tools.addWidget(self.pose_view)
         pose_layout.addLayout(pose_tools)
         self.pose_canvas = PoseCanvas()
+        self.pose_chart = QCheckBox('显示谱面')
+        self.pose_chart.setChecked(True)
+        self.pose_chart.setToolTip('将同步音符和判定线叠在双手下方；俯视时更容易检查落点')
+        self.pose_chart.toggled.connect(self.pose_canvas.set_show_chart)
+        pose_tools.insertWidget(1, self.pose_chart)
+        pose_tools.insertWidget(2, QLabel('双手不透明度'))
+        self.pose_opacity = QSlider(Qt.Horizontal)
+        self.pose_opacity.setRange(10, 100)
+        self.pose_opacity.setValue(80)
+        self.pose_opacity.setMaximumWidth(90)
+        self.pose_opacity.setToolTip('降低双手不透明度，更清楚地查看下方音符')
+        self.pose_opacity.valueChanged.connect(self.pose_canvas.set_hand_opacity)
+        pose_tools.insertWidget(3, self.pose_opacity)
         self.pose_canvas.pause_requested.connect(self.pause)
         self.pose_canvas.target_selected.connect(self._select_pose_target)
         self.pose_tool.currentIndexChanged.connect(lambda: self._pose_tool_changed())
         self.pose_view.currentIndexChanged.connect(lambda: self.pose_canvas.set_view(self.pose_view.currentData()))
         pose_layout.addWidget(self.pose_canvas, 1)
         self.view_tabs.addTab(pose_view, '手部姿态')
-        self.view_tabs.setTabToolTip(1, '调整手腕、空闲手指和抬落动作此处显示简化关节，真实手模效果可生成片段视频查看')
+        self.view_tabs.setTabToolTip(1, '在同步谱面上查看双手，调整手腕、空闲手指和抬落动作；真实手模效果可生成片段视频查看')
         preview_layout.addWidget(self.view_tabs, 1)
         transport = QHBoxLayout()
         self.play_button = QPushButton('播放 (Space)')
@@ -747,6 +760,7 @@ class EditorWindow(QMainWindow):
         self.pause()
         self.source = source
         self.canvas.set_source(source)
+        self.pose_canvas.set_chart_preview(self.canvas.preview, self.canvas.lookahead)
         audio = source.reference.get('audio') if source else None
         self.player.setSource(QUrl.fromLocalFile(audio) if audio else QUrl())
         self._update_duration()
@@ -862,7 +876,7 @@ class EditorWindow(QMainWindow):
         for key in ('model', 'blender'):
             self.settings.setValue(key, options[key])
         self.settings.setValue('generator_fingers', ['index', 'index_middle', 'all'][dialog.fingers.currentIndex()])
-        for key in ('fingering_objective', 'speed_limits', 'judgement_windows'):
+        for key in ('fingering_objective', 'speed_limits', 'judgement_windows', 'drag_ribbon_planning'):
             self.settings.setValue(key, options['settings'][key])
         self.settings.setValue('solver_beam', options['settings']['beam_width'])
         self.settings.setValue('solver_candidates', options['settings']['candidates_per_finger'])
@@ -1419,6 +1433,7 @@ class EditorWindow(QMainWindow):
         if self.canvas.render_width != self.performance['preview_width']:
             self.canvas.render_width = self.performance['preview_width']
             self.canvas.set_source(self.source)
+        self.pose_canvas.set_chart_preview(self.canvas.preview, self.canvas.lookahead)
         self.timeline.span = float(self.performance['timeline_span'])
         self.pose_timeline.span = float(self.performance['timeline_span'])
         if self.document:

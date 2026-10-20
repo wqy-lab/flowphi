@@ -102,6 +102,7 @@ def generate_draft(chart, settings, profile, console=None, *, progress=None):
                     joined_drags=sum(len(c['note_ids']) - 1 for c in contacts),
                     seconds=time.monotonic() - started, rejections=dict(planner.rejected),
                     draft_fallback_notes=[nid for c in pending for nid in c['note_ids']],
+                    ribbons=getattr(planner, 'ribbon_diagnostics', dict(enabled=False, windows=[])),
                     degraded=[dict(note_ids=c['note_ids'], time=c['start'], reasons=c['decision']['degraded'])
                               for c in contacts if c['decision']['degraded']],
                     finger_usage=dict(Counter(f'{c["hand"]}:{c["finger"]}' for c in contacts)),

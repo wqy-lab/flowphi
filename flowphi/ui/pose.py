@@ -5,7 +5,7 @@ import math
 import uuid
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
     QFormLayout, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton, QScrollArea,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -652,11 +652,15 @@ class PoseCanvas(QWidget):
         self.time = 0.
         self.selection = ('left', 'hand')
         self.mode = 'select'
-        self.azimuth, self.elevation, self.zoom = -.15, .90, 1.
+        self.azimuth, self.elevation, self.zoom = -.15, .90, 1.5
         self.editable = True
         self.hits, self._drag = [], None
         self._frame = None
         self._feedback = ''
+        self.chart_preview = None
+        self.show_chart = True
+        self.lookahead = 8.
+        self.hand_opacity = .8
         self.setMinimumSize(280, 180)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -672,6 +676,31 @@ class PoseCanvas(QWidget):
         self.engine.set_pose(pose)
         self._frame = None
         self.update()
+
+    def set_chart_preview(self, preview, lookahead=8.):
+        # Share the indexed renderer with the chart tab; time is always chart seconds.
+        self.chart_preview, self.lookahead = preview, lookahead
+        self.update()
+
+    def set_show_chart(self, visible):
+        self.show_chart = bool(visible)
+        self.update()
+
+    def set_hand_opacity(self, percent):
+        self.hand_opacity = max(.1, min(1., percent / 100.))
+        self.update()
+
+    def chart_transform(self, screen, image):
+        """Map image top-left coordinates onto the same physical plane as the fingers."""
+        width, height = screen
+        top_left = self.project((-width / 2, height / 2, 0.))
+        top_right = self.project((width / 2, height / 2, 0.))
+        bottom_left = self.project((-width / 2, -height / 2, 0.))
+        return QTransform((top_right.x() - top_left.x()) / image.width(),
+                          (top_right.y() - top_left.y()) / image.width(),
+                          (bottom_left.x() - top_left.x()) / image.height(),
+                          (bottom_left.y() - top_left.y()) / image.height(),
+                          top_left.x(), top_left.y())
 
     def set_time(self, t):
         self.time = t
@@ -716,13 +745,27 @@ class PoseCanvas(QWidget):
         painter.setPen(QPen(QColor('#496681'), 1.5))
         painter.setBrush(QColor('#1c3142'))
         painter.drawPolygon(QPolygonF(corners))
-        painter.setPen(QPen(QColor('#2c475d'), 1))
-        for i in range(1, 8):
-            x = (i / 8 - .5) * width
-            painter.drawLine(self.project((x, -height / 2, 0.)), self.project((x, height / 2, 0.)))
-        for i in range(1, 5):
-            y = (i / 5 - .5) * height
-            painter.drawLine(self.project((-width / 2, y, 0.)), self.project((width / 2, y, 0.)))
+        if self.show_chart and self.chart_preview is not None:
+            image = self.chart_preview.frame(self.time, self.lookahead)
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.setTransform(self.chart_transform(frame['screen'], image), True)
+            painter.setClipRect(QRectF(0, 0, image.width(), image.height()))
+            painter.drawImage(QPointF(0, 0), image)
+            painter.restore()
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor('#668ba7'), 1.5))
+            painter.drawPolygon(QPolygonF(corners))
+        else:
+            painter.setPen(QPen(QColor('#2c475d'), 1))
+            for i in range(1, 8):
+                x = (i / 8 - .5) * width
+                painter.drawLine(self.project((x, -height / 2, 0.)), self.project((x, height / 2, 0.)))
+            for i in range(1, 5):
+                y = (i / 5 - .5) * height
+                painter.drawLine(self.project((-width / 2, y, 0.)), self.project((width / 2, y, 0.)))
+        painter.save()
+        painter.setOpacity(self.hand_opacity)
         for hand, data in frame['hands'].items():
             color = QColor(COLORS[hand])
             selected = self.selection == (hand, 'hand')
@@ -773,6 +816,7 @@ class PoseCanvas(QWidget):
                     painter.drawText(end + QPointF(3, -3), label)
             painter.setPen(color)
             painter.drawText(root + QPointF(12, 17), HAND_NAMES[hand])
+        painter.restore()
         hand, target = self.selection
         data = frame['hands'][hand]
         if target == 'hand':
@@ -792,7 +836,9 @@ class PoseCanvas(QWidget):
             self._feedback = feedback
             self.feedback.emit(feedback)
         painter.setPen(QColor('#9eb3ce'))
-        painter.drawText(QRectF(12, 8, self.width() - 24, 22), Qt.AlignLeft, '简化关节预览 · 绿环表示接触')
+        caption = ('同步谱面与双手 · 绿环表示接触' if self.show_chart and self.chart_preview is not None
+                   else '简化关节预览 · 绿环表示接触')
+        painter.drawText(QRectF(12, 8, self.width() - 24, 22), Qt.AlignLeft, caption)
         painter.drawText(QRectF(12, self.height() - 27, self.width() - 24, 22), Qt.AlignLeft,
                          '右键转动视角 · 滚轮缩放 · 点击选择手掌或手指')
 

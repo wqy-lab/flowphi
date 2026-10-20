@@ -32,12 +32,13 @@ class Settings:
     recovery_seconds: float = .65
     allow_degraded: bool = True
     fingers: tuple[str, ...] = ('index', 'middle', 'ring', 'thumb', 'little')
-    visual_radius: float = .012
+    visual_radius: float = .012  # Legacy project field; never clips the legal judgement strip.
     hold_margin: float = .004
     flick_distance: float = .16
     fingering_objective: str = 'balanced'
     speed_limits: bool = True
     judgement_windows: bool = False
+    drag_ribbon_planning: bool = True
 
     def __post_init__(self):
         if self.fingering_objective not in ('balanced', 'load'):
@@ -72,6 +73,7 @@ class Task:
     start: int
     end: int
     beat: int
+    planning_detail: object = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +99,7 @@ def load_at(contacts, t, hand, finger=None, settings=None):
         pulse = c.get('effort', .055)
         fatigue += pulse * math.exp(-age / tau)
         debt += c.get('burst_cost', 0.) * math.exp(-age / recovery)
-        if c['kind'] == 'hold':
+        if c['kind'] == 'hold' or c['end'] - c['start'] > .12:
             duration = min(t, c['end']) - c['start']
             # Integral of sustained work with exponential recovery after release.
             fatigue += .11 * tau * (1 - math.exp(-duration / tau)) * math.exp(-max(0., t - c['end']) / tau)
@@ -122,6 +124,7 @@ class Planner:
         self.screen_poly = box(w * .01, h * .01, w * .99, h * .99)
         self.pause_poly = box(0, 0, w * .1, h * .1).union(box(w * .9, 0, w, h * .1))
         self.zones, self.paths = {}, {}
+        self.stationary_zones = {}
         self.corridor_paths = {}
         self.terminal_paths = {}
         self.judgement_times = {}
@@ -156,7 +159,8 @@ class Planner:
         self.tasks.sort(key=lambda n: (n.start, n.id))
 
     def target_time(self, task, ms):
-        # Taps stay at their judgement position; sustained contacts follow the note.
+        # Taps use their hit-time strip; sustained contacts use the current
+        # judgement band, which does not require following the note image.
         # The Hold tail is sampled just before release, not after a line's cut.
         if task.note.type == NoteType.HOLD:
             return max(task.note.seconds, min(ms / 1000, task.note.seconds + task.note.hold - .001))
@@ -171,7 +175,11 @@ class Planner:
             rot = cmath.exp(1j * (task.line.angle @ sec))
             center = task.line.pos(sec, task.note.offset)
             half = JUDGE_HALF_DRAG if task.note.type in (NoteType.DRAG, NoteType.FLICK) else JUDGE_HALF_TAP
-            legal = JudgeArea(center, rot, self.screen.width, self.screen.height, half).get_valid_poly(
+            # Match the editor's conservative along-line margins, leaving a
+            # small numerical inset when projecting onto the strip boundary.
+            margin = .49 if task.note.type in (NoteType.TAP, NoteType.HOLD) else (
+                .29 if task.note.type == NoteType.DRAG else .84)
+            legal = JudgeArea(center, rot, self.screen.width, self.screen.height, half, margin).get_valid_poly(
                 self.screen_poly, self.pause_poly)
             if self.blocks:
                 forbidden = self.blocks.forbidden(ms / 1000)
@@ -181,16 +189,9 @@ class Planner:
                 inset = legal.buffer(-self.screen.width * self.settings.hold_margin)
                 if not inset.is_empty:
                     legal = inset
-            if legal.is_empty:
-                self.zones[key] = legal
-            else:
-                # Game judgement strips can span the whole screen. Animation must
-                # hit the visible note, with only a few millimetres of local freedom.
-                visible = self.project(legal, (center.real, center.imag))
-                radius = self.screen.width * self.settings.visual_radius
-                if task.note.type == NoteType.FLICK:
-                    radius += self.screen.width * self.settings.flick_distance * abs(ms - task.beat) / 70
-                self.zones[key] = legal.intersection(Point(*visible).buffer(radius))
+            # Judgement constrains the along-line projection, not distance to
+            # the visible note. The entire on-screen normal direction is legal.
+            self.zones[key] = legal
         return self.zones[key]
 
     def project(self, zone, seed):
@@ -224,13 +225,25 @@ class Planner:
                            .5 - (a[1] + offset[1]) / self.physical[1])
         else:
             coordinated = (.5 + side * .24 + offset[0] / self.physical[0], .60)
-        targets = [(current.real, current.imag), (coordinated[0] * w, coordinated[1] * h)]
+        targets = []
         if last:
             targets.append((last['points'][-1][1] * w, last['points'][-1][2] * h))
+        targets.append((coordinated[0] * w, coordinated[1] * h))
+        # Separate simultaneous contacts along the free normal instead of
+        # forcing both fingers into the same tiny patch around the note image.
+        normal = cmath.exp(1j * (task.line.angle @ task.note.seconds)) * 1j
+        clearance = .024 * w / self.physical[0]
+        base = targets[0]
+        # Also offer the robust center of the along-line band at the current
+        # hand's normal coordinate. Centering along the line must not pull the
+        # finger back onto the visible line itself.
+        preferred = current + normal * ((complex(*base) - current) * normal.conjugate()).real
+        targets.append((preferred.real, preferred.imag))
+        for sign in (-1, 1):
+            targets.append((base[0] + sign * normal.real * clearance,
+                            base[1] + sign * normal.imag * clearance))
+        targets.append((current.real, current.imag))
         zone = self.zone(task, task.beat if task.note.type == NoteType.FLICK else task.start)
-        if task.note.type in (NoteType.HOLD, NoteType.DRAG):
-            point = self.project(zone, (current.real, current.imag))
-            return [point] if point is not None else []
         result = []
         for seed in targets:
             p = self.project(zone, seed)
@@ -247,24 +260,36 @@ class Planner:
             times = sorted(set(times) | {ms for t in self.blocks.key_times
                            for ms in (math.floor(t * 1000) - 1, math.floor(t * 1000), math.ceil(t * 1000))
                            if task.start <= ms <= end})
-        points, pos = [], seed
+        pos = seed
+        if task.note.type in (NoteType.HOLD, NoteType.DRAG):
+            # A common band intersection can keep a whole sustained action
+            # stationary, including when the line rotates around the contact.
+            shared_key = (task.id, task.note.seconds, task.start, end)
+            if shared_key not in self.stationary_zones:
+                shared = self.zone(task, times[0])
+                for ms in times[1:]:
+                    shared = shared.intersection(self.zone(task, ms))
+                    if shared.is_empty:
+                        break
+                self.stationary_zones[shared_key] = shared
+            shared = self.stationary_zones[shared_key]
+            if not shared.is_empty:
+                pos = self.project(shared, seed)
+        points = []
         normal = cmath.exp(1j * (task.line.angle @ task.note.seconds)) * 1j
         if abs(direction) == 2:
             normal *= -1j
         normal *= 1 if direction > 0 else -1
         flick_distance = self.screen.width * self.settings.flick_distance
-        origin = task.line.pos(self.target_time(task, task.start), task.note.offset)
         for ms in times:
             if task.note.type == NoteType.FLICK:
                 u = (ms - task.beat) / (end - task.start)
                 target = (seed[0] + normal.real * flick_distance * u,
                           seed[1] + normal.imag * flick_distance * u)
-            elif task.note.type in (NoteType.HOLD, NoteType.DRAG):
-                center = task.line.pos(self.target_time(task, ms), task.note.offset)
-                target = (center.real, center.imag)
             else:
-                center = task.line.pos(self.target_time(task, ms), task.note.offset)
-                target = (seed[0] + center.real - origin.real, seed[1] + center.imag - origin.imag)
+                # Keep the current contact while it remains legal. A line
+                # moving along its normal does not require the finger to follow.
+                target = pos
             pos = self.project(self.zone(task, ms), target)
             if pos is None:
                 self.paths[key] = None
@@ -283,13 +308,18 @@ class Planner:
         self.paths[key] = points
         return points
 
-    def constraints(self, record, state, side, finger):
-        """Return physical violations and normalized movement/pose costs."""
+    def constraints(self, record, state, side, finger, *, continuation=False):
+        """Check physical constraints; a continuation is an already clipped suffix.
+
+        A continuous DOWN adds no lifted-finger/wrist transfer, but its newly
+        occupied interval still needs speed, occupancy, span and pad checks.
+        """
         t, end = record['start'], record['end']
         if any(c['hand'] == record['hand'] and c['finger'] == finger and
                max(t, c['start']) < min(end, c['end']) - 1e-9 for c in state.contacts):
             return ['occupied'], 0., 0.
-        previous = next((c for c in reversed(state.contacts) if c['hand'] == record['hand'] and c['finger'] == finger), None)
+        previous = None if continuation else next((c for c in reversed(state.contacts)
+            if c['hand'] == record['hand'] and c['finger'] == finger), None)
         violations, movement, posture = [], 0., 0.
         xy = world_xy(record['points'][0][1:], self.physical)
         if previous:
@@ -302,7 +332,12 @@ class Planner:
             if gap < required:
                 violations.append('finger_transfer')
         a = self.anchor(record, t)
-        hand_previous = next((c for c in reversed(state.contacts) if c['hand'] == record['hand']), None)
+        hand_previous = None if continuation else next((c for c in reversed(state.contacts)
+            if c['hand'] == record['hand']), None)
+        if hand_previous is None and not continuation:
+            offset = self.offset(side, finger)
+            rest = world_xy((.5 + side * .24 + offset[0] / self.physical[0], .60), self.physical)
+            movement += (math.dist(xy, rest) / .10) ** 2
         if hand_previous and hand_previous['end'] < t:
             distance = math.dist(self.anchor(hand_previous, hand_previous['end']), a)
             required = travel_time(max(0., distance - .025), self.settings.wrist_speed, self.settings.wrist_acceleration)
@@ -486,62 +521,46 @@ class Planner:
                         continue
                     if 'occupied' in violations:
                         continue
-                    x, y = points[0][1:]
-                    center = task.line.pos(task.note.seconds, task.note.offset)
-                    visual = ((x - center.real / self.screen.width) ** 2 +
-                              (y - center.imag / self.screen.height) ** 2) * 80.
-                    side_cost = max(0., -.03 - side * (x - .5)) ** 2 * 12
-                    same_style = .08 if previous and task.note.type == NoteType.TAP and cps < 2 else 0.
-                    if (previous and task.note.type == NoteType.DRAG and previous['kind'] == 'drag'
-                            and t - previous['end'] <= .14
-                            and math.dist(world_xy(previous['points'][-1][1:], self.physical),
-                                          world_xy(points[0][1:], self.physical)) < .055):
-                        # Safe Drag continuation avoids an unnecessary handover/lift; final bridging is checked below.
-                        same_style += .4
-                    if self.settings.fingering_objective != 'load':
-                        record['effort'] += .02 * min(3., math.sqrt(movement))
-                    own_f, own_b = load_at((record,), record['end'], hand, finger, self.settings)
-                    after_f, after_b = min(1., base_after_f + own_f), max(0., base_after_b - (1 - own_b))
-                    costs = dict(preference=PREFERENCE[finger], fatigue=.8 * fatigue + 1.5 * max(0., after_f - fatigue),
-                                 burst=2 * burst_cost + .2 * (1 - after_b),
-                                 hand=.6 * hand_fatigue + .3 * (1 - hand_burst),
-                                 movement=.35 * movement, posture=.8 * posture,
-                                 visual=visual, side=side_cost, habit=-same_style,
-                                 degraded=1000. * len(violations))
-                    if self.settings.fingering_objective == 'load':
-                        for name in ('preference', 'movement', 'posture', 'visual', 'side', 'habit', 'degraded'):
-                            costs[name] = 0.
-                    record['decision'] = dict(costs=costs, fatigue_before=fatigue, fatigue_after=after_f,
-                        burst_before=burst, burst_after=after_b, hand_fatigue=hand_fatigue,
-                        finger_cps=cps, degraded=violations)
-                    score = sum(costs.values())
+                    from flowphi.planning.scoring import score_contact
+                    score = score_contact(self, record, state.contacts, movement, posture, violations)
                     candidates.append((score, record))
             candidates.sort(key=lambda x: (x[0], x[1]['points'][0][1:]))
             result.extend(candidates[:self.settings.candidates_per_finger])
         return result
 
     def run(self, console=None, *, on_unplanned=None, progress=None):
+        if self.settings.drag_ribbon_planning:
+            from flowphi.planning.ribbons import run_ribbons
+            return run_ribbons(self, console, on_unplanned=on_unplanned, progress=progress)
+        self.ribbon_diagnostics = dict(enabled=False, windows=[])
+        return self._run_plain(console, on_unplanned=on_unplanned, progress=progress)
+
+    def _run_plain(self, console=None, *, on_unplanned=None, progress=None,
+                   tasks=None, initial_states=None, return_states=False, width=None):
         """Plan contacts, optionally reporting unsolved notes to a draft editor.
 
         A reported note stays outside the search state so an unverified draft
         trajectory cannot influence sharing or occupancy of later contacts.
         Callers using this hook must retain the reported notes themselves.
         """
-        beam = [State()]
+        tasks = self.tasks if tasks is None else tasks
+        task_ids = {t.id for t in tasks}
+        beam = [State()] if initial_states is None else list(initial_states)
+        width = self.settings.beam_width if width is None else width
         drag_representatives = {}
         swept = set()
-        for index, task in enumerate(self.tasks):
+        for index, task in enumerate(tasks):
             if progress:
-                progress(index, len(self.tasks), task)
+                progress(index, len(tasks), task)
             if task.id in swept:
                 continue
             if self.settings.judgement_windows and self.settings.fingers == ('index',):
                 from flowphi.planning.sweeps import outward_group, sweep_states
                 group = outward_group(self, task)
-                if group:
+                if group and all(t.id in task_ids for t in group[-1]):
                     states = [new for state in beam for new in sweep_states(self, group, state)]
                     if states:
-                        beam = sorted(states, key=lambda s: s.score)[:self.settings.beam_width]
+                        beam = sorted(states, key=lambda s: s.score)[:width]
                         swept.update(t.id for t in group[-1])
                         if console: console.print(f'OUTWARD_SWEEP {task.beat / 1000:.3f}s notes={len(group[-1])}')
                         continue
@@ -559,6 +578,9 @@ class Planner:
             rejected_before = self.rejected.copy()
             expanded = []
             for state in beam:
+                # Continuing a touch is a normal Drag candidate, not a last
+                # resort after every independent DOWN has already failed.
+                expanded.extend(self.share_drag(task, state))
                 for cost, record in self.choices(task, state):
                     expanded.append(State((*state.contacts, record), state.score + cost))
             if not expanded and self.settings.allow_degraded:
@@ -568,7 +590,6 @@ class Planner:
             if not expanded:
                 for state in beam:
                     expanded.extend(self.share_flick_hold(task, state))
-                    expanded.extend(self.share_drag(task, state))
                     expanded.extend(self.flick_on_contact(task, state))
                     if not self.settings.speed_limits:
                         expanded.extend(self.flick_after_hold(task, state))
@@ -594,17 +615,21 @@ class Planner:
             signatures, beam = Counter(), []
             for node in expanded:
                 node = State(tuple(sorted(node.contacts, key=lambda c: (c['start'], c['pointer']))), node.score)
-                signature = tuple((c['hand'], c['finger']) for c in node.contacts[-3:])
+                ribbon_history = tuple((d['window'], d['strategy'], repr(d.get('route_signature', ())))
+                    for c in node.contacts for d in c.get('ribbon_decisions', ()))[-2:]
+                signature = (tuple((c['hand'], c['finger']) for c in node.contacts[-3:]), ribbon_history)
                 if signatures[signature] >= 2:
                     continue
                 signatures[signature] += 1
                 beam.append(node)
-                if len(beam) == self.settings.beam_width:
+                if len(beam) == width:
                     break
-            if console and (index % 50 == 0 or index + 1 == len(self.tasks)):
-                console.print(f'flowphi: {index + 1}/{len(self.tasks)} notes, {len(beam)} candidates')
+            if console and (index % 50 == 0 or index + 1 == len(tasks)):
+                console.print(f'flowphi: {index + 1}/{len(tasks)} notes, {len(beam)} candidates')
         if progress:
-            progress(len(self.tasks), len(self.tasks), None)
+            progress(len(tasks), len(tasks), None)
+        if return_states:
+            return beam
         return list(min(beam, key=lambda n: n.score).contacts)
 
     @staticmethod
@@ -735,44 +760,8 @@ class Planner:
         return result
 
     def share_drag(self, task, state):
-        """Keep an occupied touch down when it can also cover the next Drag."""
-        if task.note.type != NoteType.DRAG:
-            return []
-        from flowphi.planning.contacts import ContactGeometry, refine_contact, validate_contact
-        geometry = ContactGeometry(self.chart, physical_screen=self.physical, extra_clearance_m=.004)
-        result = []
-        for index, old in enumerate(state.contacts):
-            if not old['start'] <= task.beat / 1000 < old['end']:
-                continue
-            merged = copy.deepcopy(old)
-            merged.update(note_ids=[*old['note_ids'], task.id], joint_note_coverage=True,
-                          end=max(old['end'], (task.beat + 12) / 1000), shared_contact='covered_drag')
-            if task.id in self.judgement_times:
-                merged.setdefault('judgement_times', {})[str(task.id)] = self.judgement_times[task.id]
-            if old['kind'] == 'tap':
-                merged['kind'] = 'drag'
-            if merged['end'] > old['end']:
-                merged['points'].append([merged['end'] - .001, *old['points'][-1][1:]])
-            window = dict(merged, note_ids=[task.id], kind='drag',
-                        start=max(old['start'], task.note.seconds - .0011),
-                        end=min(old['end'], task.note.seconds + .011))
-            if merged['end'] == old['end'] and not validate_contact(geometry, window, old['points']):
-                contacts = list(state.contacts); contacts[index] = merged
-                result.append(State(tuple(contacts), state.score))
-                continue
-            extra = set()
-            for attempt in range(3):
-                points, _ = refine_contact(geometry, merged, extra_times=extra)
-                if points is None:
-                    break
-                bad = validate_contact(geometry, merged, points, limit=100)
-                if not bad and not self.blocks.path_violations(points, merged['start'], merged['end']):
-                    merged['points'] = points
-                    contacts = list(state.contacts); contacts[index] = merged
-                    result.append(State(tuple(contacts), state.score))
-                    break
-                extra.update(bad)
-        return result
+        from flowphi.planning.drag_continuation import drag_continuations
+        return drag_continuations(self, task, state)
 
     def flick_on_contact(self, task, state):
         """Slide an already pressed fingertip, retaining any live Hold bands."""
@@ -822,13 +811,26 @@ class Planner:
                             for nid in set(previous['note_ids'] + c['note_ids'])) <= 1):
                 merged = dict(previous, end=c['end'], points=previous['points'] + c['points'],
                               note_ids=previous['note_ids'] + c['note_ids'],
+                              joint_note_coverage=True,
                               judgement_times={**previous.get('judgement_times', {}), **c.get('judgement_times', {})},
                               effort=previous['effort'] + c['effort'])
+                if previous.get('ribbon_decisions') or c.get('ribbon_decisions'):
+                    merged['ribbon_decisions'] = [*previous.get('ribbon_decisions', ()), *c.get('ribbon_decisions', ())]
                 others = tuple(other for other in contacts if other is not c and other is not previous
                                and not set(other['note_ids']).intersection(merged['note_ids']))
                 side = -1 if c['hand'] == 'left' else 1
                 errors, _, _ = self.constraints(merged, State(others), side, c['finger'])
-                if not errors:
+                # Joining creates a newly held bridge. Physical constraints
+                # alone cannot detect a temporary chart blocking area there.
+                from flowphi.planning.drag_continuation import _window_valid
+                from flowphi.planning.contacts import ContactGeometry
+                geometry = getattr(self, '_drag_geometry', None)
+                if geometry is None:
+                    geometry = self._drag_geometry = ContactGeometry(self.chart,
+                        physical_screen=self.physical, extra_clearance_m=.004, cache_judgement=True)
+                bridge = dict(merged, start=previous['points'][-1][0],
+                              end=min(merged['end'], c['start']+.0111))
+                if not errors and _window_valid(self, geometry, bridge, merged['points']):
                     result[index] = merged
                     continue
             last[key] = len(result)
@@ -881,6 +883,7 @@ def plan(chart, config=None, console=None, *, settings=None, profile=None, view_
         psap_sha256=hashlib.sha256(content).hexdigest(), contacts=contacts, hand_rest=rests, profile=profile,
         physical_screen=list(planner.physical), settings=vars(settings), palm_motion='v4',
         diagnostics=dict(notes=len(planner.tasks), contacts=len(contacts),
+            ribbons=getattr(planner, 'ribbon_diagnostics', dict(enabled=False, windows=[])),
             joined_drags=sum(len(c['note_ids']) - 1 for c in contacts), seconds=time.monotonic() - started,
             rejections=dict(planner.rejected), degraded=[dict(note_ids=c['note_ids'], time=c['start'],
                 reasons=c['decision']['degraded']) for c in contacts if c['decision']['degraded']],
