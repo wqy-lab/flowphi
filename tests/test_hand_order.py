@@ -57,6 +57,31 @@ class HandOrderTests(unittest.TestCase):
         self.assertGreater(long_cost, short_cost)
         self.assertGreater(short_cost, 0.)
 
+    def test_old_live_hold_is_checked_past_ended_short_contacts(self):
+        planner = self.planner()
+        hold = record('left', 'index', .95, .95, start=0., end=4.)
+        hold['kind'] = 'hold'
+        ended = record('left', 'middle', .3, .3, start=1., end=1.1)
+        right = record('right', 'index', .2, .2, start=2., end=2.4)
+        excess, seconds, at = planner.hand_crossing(right, (hold, ended))
+        self.assertGreater(excess, .05)
+        self.assertAlmostEqual(.4, seconds)
+        self.assertTrue(2. <= at < 2.4)
+        score_contact(planner, right, (hold, ended), 0., 0., [])
+        self.assertGreater(right['decision']['costs']['crossing'], 0.)
+        self.assertEqual((0., 0., None), planner.hand_crossing(
+            right, (dict(hold, end=2.), ended)))
+
+    def test_shared_points_cache_separates_hand_and_finger(self):
+        planner = self.planner()
+        shared = record('left', 'index', .5, .6)
+        for hand, finger in (('left', 'index'), ('right', 'index'),
+                             ('right', 'middle'), ('left', 'middle')):
+            c = dict(shared, hand=hand, finger=finger)
+            expected = tuple(sorted(planner.anchor(c, t)[0] for t in (1., 1.4)))
+            self.assertEqual(expected, planner._anchor_bounds(c))
+            self.assertEqual(expected, planner._anchor_bounds(c))
+
 
 class CrossedHandWarningTests(unittest.TestCase):
     class Document:

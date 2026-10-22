@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass, replace
 import copy
 import cmath
@@ -39,6 +39,10 @@ class Settings:
     speed_limits: bool = True
     judgement_windows: bool = False
     drag_ribbon_planning: bool = True
+    occlusion_weight: float = 4.
+    judge_line_weight: float = 6.
+    hand_interaction_weight: float = 1.
+    hand_motion_repair: bool = True
 
     def __post_init__(self):
         if self.fingering_objective not in ('balanced', 'load'):
@@ -59,6 +63,12 @@ class Settings:
             raise ValueError('Invalid Hold judgement margin')
         if not .10 <= self.flick_distance <= .25:
             raise ValueError('Invalid Flick distance')
+        if not math.isfinite(self.occlusion_weight) or self.occlusion_weight < 0:
+            raise ValueError('Invalid note occlusion weight')
+        if not math.isfinite(self.judge_line_weight) or self.judge_line_weight < 0:
+            raise ValueError('Invalid judge-line preference weight')
+        if not math.isfinite(self.hand_interaction_weight) or self.hand_interaction_weight < 0:
+            raise ValueError('Invalid hand interaction weight')
 
 
 class PlanningError(ValueError):
@@ -129,7 +139,11 @@ class Planner:
         if not self.keys:
             raise ValueError('Hand profile has no enabled fingers')
         w, h = chart.width, chart.height
-        self.screen_poly = box(w * .01, h * .01, w * .99, h * .99)
+        from flowphi.planning.contacts import SCREEN_MARGIN
+        # Match the independent validator. A small inward numerical guard keeps
+        # projected edge seeds inside it after screen/normalised conversion.
+        edge = SCREEN_MARGIN + .00001
+        self.screen_poly = box(w * edge, h * edge, w * (1-edge), h * (1-edge))
         self.pause_poly = box(0, 0, w * .1, h * .1).union(box(w * .9, 0, w, h * .1))
         self.zones, self.paths = {}, {}
         self.stationary_zones = {}
@@ -224,16 +238,17 @@ class Planner:
     def _anchor_bounds(self, contact):
         """Cached horizontal range of a contact's wrist anchors."""
         cache = self._crossing_bounds
-        entry = cache.get(id(contact['points']))
-        if entry is not None and entry[0] is contact['points']:
-            return entry[1], entry[2]
         side = -1 if contact['hand'] == 'left' else 1
         offset = self.offset(side, contact['finger'])[0]
+        key = (id(contact['points']), contact['hand'], contact['finger'], offset)
+        entry = cache.get(key)
+        if entry is not None and entry[0] is contact['points']:
+            return entry[1], entry[2]
         xs = [((p[1] - .5) * self.physical[0]) - offset for p in contact['points']]
         bounds = (min(xs), max(xs))
         if len(cache) > 4096:
             cache.clear()
-        cache[id(contact['points'])] = (contact['points'], *bounds)
+        cache[key] = (contact['points'], *bounds)
         return bounds
 
     def hand_crossing(self, record, contacts, low=None, high=None):
@@ -247,10 +262,11 @@ class Planner:
         high = record['end'] if high is None else high
         tolerance = CROSS_TOLERANCE * self.profile['scale'] / .27
         excess, seconds, at = 0., 0., None
-        # Search histories are ordered by start, so only nearby contacts can overlap.
+        # Start order cannot bound overlap: an earlier Hold may still be down
+        # after arbitrarily many later short contacts have already ended.
         for other in reversed(contacts):
-            if other['start'] < low - .65:
-                break
+            if other['end'] <= low:
+                continue
             if other['start'] > high or other['hand'] == record['hand']:
                 continue
             start, stop = max(low, other['start']), min(high, other['end'])
@@ -302,6 +318,11 @@ class Planner:
             targets.append((base[0] + sign * normal.real * clearance,
                             base[1] + sign * normal.imag * clearance))
         targets.append((current.real, current.imag))
+        # Offer modest normal offsets near the line as well as the inherited
+        # location. A legal high-screen contact must not become a sticky lane.
+        for sign in (-1, 1):
+            target = current + normal * clearance * sign * .5
+            targets.append((target.real,target.imag))
         zone = self.zone(task, task.beat if task.note.type == NoteType.FLICK else task.start)
         result = []
         for seed in targets:
@@ -500,23 +521,39 @@ class Planner:
         self.corridor_paths[key] = result
         return result
 
+    def load_at(self,history,t,hand,finger=None):
+        cache=getattr(self,'_load_cache',None)
+        if cache is None:cache=self._load_cache=OrderedDict()
+        key=(id(history),len(history),id(history[-1]) if history else None,t,hand,finger)
+        old=cache.get(key)
+        if old is not None and old[0] is history:
+            cache.move_to_end(key);return old[1]
+        value=load_at(history,t,hand,finger,self.settings)
+        cache[key]=(history,value)
+        if len(cache)>512:cache.popitem(last=False)
+        return value
+
     def choices(self, task, state, degraded=False):
         result = []
         t = task.start / 1000
-        hands = {hand: load_at(state.contacts, t, hand, settings=self.settings) for hand in ('left', 'right')}
-        for side, finger in self.keys:
+        hands = {hand: self.load_at(state.contacts,t,hand) for hand in ('left', 'right')}
+        center=task.line.pos(task.note.seconds,task.note.offset).real/self.screen.width
+        preferred=('left' if center<.47 else 'right' if center>.53 else None) if getattr(self,'_physical_spatial_policy',False) else None
+        keys=sorted(self.keys,key=lambda key:('left' if key[0]==-1 else 'right')!=preferred) if preferred else self.keys
+        for side, finger in keys:
             hand = 'left' if side == -1 else 'right'
+            if preferred and hand!=preferred and any(c['hand']==preferred for _,c in result):continue
             previous = next((c for c in reversed(state.contacts) if c['hand'] == hand and c['finger'] == finger), None)
             if previous and previous['end'] > t + 1e-9:
                 self.rejected['occupied'] += 1
                 continue
-            fatigue, burst = load_at(state.contacts, t, hand, finger, self.settings)
+            fatigue, burst = self.load_at(state.contacts,t,hand,finger)
             hand_fatigue, hand_burst = hands[hand]
             cps = 1 / max(.001, t - previous['start']) if previous else 0.
             comfort = COMFORT[finger] * (1 - .3 * fatigue - .15 * hand_fatigue)
             limit = PEAK[finger] * (.65 + .35 * burst) * (1 - .2 * hand_fatigue)
             over = cps > limit and task.note.type in (NoteType.TAP, NoteType.HOLD)
-            if over and not degraded and self.settings.fingering_objective != 'load':
+            if over and not degraded and self.settings.fingering_objective != 'load' and not getattr(self,'_physical_plain_search',False):
                 self.rejected['burst_capacity'] += 1
                 continue
             burst_cost = .10 * max(0., cps / comfort - 1) if task.note.type == NoteType.TAP else 0.
@@ -528,7 +565,7 @@ class Planner:
                 # Short successive Drags are joined into a continuous stroke below.
                 dwell = 12
             end = task.end if task.note.type in (NoteType.HOLD, NoteType.FLICK) else task.start + dwell
-            base_after_f, base_after_b = load_at(state.contacts, (end + 1) / 1000, hand, finger, self.settings)
+            base_after_f, base_after_b = self.load_at(state.contacts,(end+1)/1000,hand,finger)
             candidates = []
             seeds = self.seeds(task, state, side, finger)
             if not seeds:
@@ -575,7 +612,11 @@ class Planner:
                     violations, movement, posture = self.constraints(record, state, side, finger)
                     if over:
                         violations.append('burst_capacity')
-                    if violations and not degraded and self.settings.fingering_objective != 'load':
+                    pending_transfers = (set(violations) & {'finger_transfer','wrist_transfer'}
+                        if getattr(self,'_speculative_transfers',False) else set())
+                    if getattr(self,'_physical_plain_search',False):
+                        pending_transfers |= set(violations)&{'burst_capacity'}
+                    if set(violations)-pending_transfers and not degraded and self.settings.fingering_objective != 'load':
                         self.rejected.update(violations)
                         continue
                     if 'occupied' in violations:
@@ -592,7 +633,8 @@ class Planner:
             from flowphi.planning.ribbons import run_ribbons
             return run_ribbons(self, console, on_unplanned=on_unplanned, progress=progress)
         self.ribbon_diagnostics = dict(enabled=False, windows=[])
-        return self._run_plain(console, on_unplanned=on_unplanned, progress=progress)
+        from flowphi.planning.physical_plain import run_ordinary
+        return run_ordinary(self,console,on_unplanned=on_unplanned,progress=progress)
 
     def _run_plain(self, console=None, *, on_unplanned=None, progress=None,
                    tasks=None, initial_states=None, return_states=False, width=None):
@@ -613,6 +655,14 @@ class Planner:
                 progress(index, len(tasks), task)
             if task.id in swept:
                 continue
+            from flowphi.planning.chords import chord_group, chord_states
+            group = chord_group(tasks, index, self.settings.fingers)
+            if group and self.settings.hand_interaction_weight:
+                states = chord_states(self, group, beam, progress, width=width)
+                if states:
+                    beam = states[:width]
+                    swept.update(t.id for t in group)
+                    continue
             if self.settings.judgement_windows and self.settings.fingers == ('index',):
                 from flowphi.planning.sweeps import outward_group, sweep_states
                 group = outward_group(self, task)
@@ -657,6 +707,12 @@ class Planner:
                 if self.settings.judgement_windows:
                     for state in beam:
                         expanded.extend(self.window_choices(task, state))
+            if expanded and getattr(self,'_physical_spatial_policy',False):
+                center=task.line.pos(task.note.seconds,task.note.offset).real/self.screen.width
+                hand='left' if center<.47 else 'right' if center>.53 else None
+                preferred=[s for s in expanded if any(task.id in c['note_ids'] and c['hand']==hand
+                                                      for c in s.contacts)] if hand else []
+                if preferred:expanded=preferred
             if not expanded:
                 reasons = dict(self.rejected - rejected_before)
                 if on_unplanned is None:
@@ -923,6 +979,8 @@ def plan(chart, config=None, console=None, *, settings=None, profile=None, view_
     for c in contacts:
         if c['kind'] != 'flick':
             c['points'] = compact_stationary(c['points'])
+    from flowphi.planning.ribbons import audit_hand_motion
+    audit_hand_motion(planner, contacts, progress)
     rests = finish_motion(contacts, profile, planner.physical, view_width or settings.screen_width_m / .82)
     frames = defaultdict(list)
     for c in contacts:

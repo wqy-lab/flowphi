@@ -11,6 +11,30 @@ from flowphi.planning.contacts import ContactGeometry, refine_contact, validate_
 
 # Search horizon, not a game judgement window. Long idle gaps remain separate.
 MAX_IDLE_GAP = .35
+TAIL_CACHE_LIMIT=512
+
+
+def _refined_tail(planner,geometry,tail):
+    """Exact geometry memo shared by different finger/history assignments."""
+    cache=getattr(planner,'_drag_tail_cache',None)
+    if cache is None:cache=planner._drag_tail_cache=OrderedDict()
+    key=(geometry,tail['start'],tail['end'],tuple(tail['note_ids']),
+         tuple(map(tuple,tail['points'])),tuple(sorted(tail.get('judgement_times',{}).items())),
+         repr({k:tail.get(k) for k in ('joint_note_coverage','joint_note_windows','collective_hold',
+             'refinement_region','block_clearance_m','refinement_start','refinement_end')}))
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    extra=set();points=None
+    for _ in range(3):
+        trial,_=refine_contact(geometry,tail,extra_times=extra)
+        if trial is None:break
+        bad=validate_contact(geometry,tail,trial,limit=20)
+        if not bad:points=trial;break
+        extra.update(bad)
+    cache[key]=points
+    if len(cache)>TAIL_CACHE_LIMIT:cache.popitem(last=False)
+    return points
 
 
 def _window_valid(planner, geometry, contact, points):
@@ -100,27 +124,30 @@ def drag_continuations(planner, task, state):
             if old['end'] > beat + 1e-9:
                 continue
             start = round(old['end'] - .001, 3)
+            # A Tap's chosen UP/dwell is not a mandatory stationary Hold.
+            # Within an uncommitted physical-search window, compare starting
+            # the continuous movement after its judgement guard instead of
+            # freezing the entire dwell and rushing into the next Drag.
+            originals=[planner.original_tasks[n] for n in old['note_ids']]
+            if (getattr(planner,'_physical_spatial_policy',False) and
+                    old['start']>=getattr(planner,'_physical_window_start',float('inf')) and
+                    all(t.note.type in (NoteType.TAP,NoteType.DRAG) for t in originals)):
+                heads=[t for t in originals if t.note.type==NoteType.TAP]
+                if len(heads)==1:
+                    guard=max(old['start'],geometry.judgement_time(old,heads[0].id)+.012)
+                    start=min(start,math.ceil((guard-1e-9)*1000)/1000)
             anchor = point_at(old['points'], start)
             tail = dict(merged, kind='drag', start=start,
                         refinement_start=list(anchor),
                         points=[[start, *anchor], [merged['end'] - .001, *anchor]])
-            extra = set()
-            points = None
-            for _ in range(3):
-                trial, _ = refine_contact(geometry, tail, extra_times=extra)
-                if trial is None:
-                    break
-                bad = validate_contact(geometry, tail, trial, limit=20)
-                if not bad:
-                    points = trial
-                    break
-                extra.update(bad)
+            points = _refined_tail(planner,geometry,tail)
             if points is None:
                 continue
             # The endpoint constraint makes the join continuous. Prefix points,
             # including every original Flick sample, stay bit-for-bit identical.
-            merged['points'] = [*old['points'], *[p for p in points if p[0] > old['points'][-1][0]]]
-            changed_from = old['points'][-1][0]
+            prefix=[p for p in old['points'] if p[0]<start]
+            merged['points'] = [*prefix,*points]
+            changed_from = start
             window = dict(merged, start=start)
             if validate_contact(geometry, window, merged['points'], limit=1):
                 continue
@@ -155,6 +182,25 @@ def drag_continuations(planner, task, state):
             costs=dict(previous_decision.get('costs', {})))
         costs = merged['decision']['costs']
         costs['continuation'] = costs.get('continuation', 0.) + increment
+        # A continuation changes the whole physical lifetime; only charge the
+        # difference from the previous silhouette, never a fresh DOWN's cost.
+        if planner.settings.occlusion_weight:
+            from flowphi.planning.occlusion import scorer
+            visibility = scorer(planner)
+            occlusion = visibility.contact(merged)
+            delta = planner.settings.occlusion_weight*(occlusion-visibility.contact(old))
+            increment += delta
+            costs['occlusion'] = planner.settings.occlusion_weight*occlusion
+            merged['decision']['occlusion'] = dict(weighted_note_seconds=occlusion,
+                model='projected_contact_proxy', lookahead_seconds=.65)
+        if planner.settings.hand_interaction_weight:
+            from flowphi.planning.interaction import contact_relation
+            others = tuple(c for i, c in enumerate(state.contacts) if i != index)
+            interaction = contact_relation(planner, merged, others)
+            before = contact_relation(planner, old, others)
+            increment += planner.settings.hand_interaction_weight*(interaction['cost']-before['cost'])
+            costs['interaction'] = planner.settings.hand_interaction_weight*interaction['cost']
+            merged['decision']['interaction'] = interaction
         contacts = list(state.contacts)
         contacts[index] = merged
         if planner.contact_occupancy_valid(contacts):

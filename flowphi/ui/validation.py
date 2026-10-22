@@ -44,12 +44,14 @@ def quick_check(document, indices=None, *, chart=None, time_range=None):
     return problems
 
 
-def head_check(document, notes, time_range=None):
+def head_check(document, notes, time_range=None, *, expected_ids=None):
     """Match each Tap/Hold head to a distinct physical DOWN."""
     from flowphi.charts.model import NoteType
     from flowphi.planning.timing import PLANNING_WINDOW_MS
     candidates = {}
     for nid, (_, note) in enumerate(notes):
+        if expected_ids is not None and nid not in expected_ids:
+            continue
         if note.type not in (NoteType.TAP, NoteType.HOLD):
             continue
         candidates[nid] = [i for i in document.note_contacts.get(nid, ())
@@ -189,6 +191,32 @@ def hand_crossing_warnings(document):
     return result
 
 
+def hand_interaction_warnings(document):
+    """Recompute soft transfer/palm warnings from current edited contacts."""
+    from types import SimpleNamespace
+    from flowphi.planning.interaction import contact_relation
+    contacts = sorted(((i, document.contact(i)) for i in range(len(document))),
+                      key=lambda row: (row[1]['start'], row[1].get('pointer', 0)))
+    planner = SimpleNamespace(profile=document.baseline['profile'],
+        physical=document.baseline['physical_screen'], settings=SimpleNamespace(
+            fingers=tuple({c['finger'] for _,c in contacts})))
+    result, history = [], []
+    for i, contact in contacts:
+        report = contact_relation(planner, contact, history)
+        if report['cost'] >= .8:
+            if result and contact['start']-result[-1]['end_time'] < .30:
+                result[-1]['contacts'] = sorted(set((*result[-1]['contacts'], i)))
+                result[-1]['end_time'] = max(result[-1]['end_time'],contact['end'])
+            else:
+                problem = issue('hand_interaction',
+                    '准备、换指或释放时可能与对侧手指/掌面交错；建议调整落点或换手，并用同步手部预览复核（近似投影提示）',
+                    [i], contact['start'], 'warning')
+                problem['end_time'] = contact['end']
+                result.append(problem)
+        history.append(contact)
+    return result
+
+
 def validate(document, chart, *, geometry=True, progress=None, time_range=None, resolved=False):
     if not resolved:
         from flowphi.ui.model import PlanDocument
@@ -201,6 +229,21 @@ def validate(document, chart, *, geometry=True, progress=None, time_range=None, 
         report['valid'] = not any(p['severity'] == 'error' for p in report['issues'])
         return report
     problems = quick_check(document, chart=chart, time_range=time_range)
+    generation = document.baseline.get('diagnostics', {}).get('generation', {})
+    if generation.get('complete') is False:
+        problems.append(issue('generation_incomplete',
+            '这是恢复初稿，生成后的最终复核尚未完成；请检查动作，勿将其视为已通过手部验证的结果',
+            [], 0., 'warning'))
+    from flowphi.hand_limits import ANATOMY_MODEL
+    diagnostics = document.baseline.get('diagnostics', {})
+    saved_motion = [w.get('hand_motion') for w in diagnostics.get('ribbons', {}).get('windows', ())]
+    saved_motion.extend(w.get('final_motion') or w.get('selected_motion')
+                        for w in diagnostics.get('ordinary_hand_search', {}).get('windows', ()))
+    if any(m and m.get('model') == 'shared_constrained_skeleton' and m.get('anatomy_model') != ANATOMY_MODEL
+           for m in saved_motion):
+        problems.append(issue('outdated_hand_anatomy',
+            '工程中的手部检查来自旧关节模型，未检查新的指节活动方向限制；请用新模型重新评估或生成',
+            [], 0., 'warning'))
     notes = [(line, n) for line in chart.lines for n in line.notes]
     expected = {i for i, (_, n) in enumerate(notes) if time_range is None or
                 (n.seconds < time_range[1] and n.seconds + max(n.hold, .001) > time_range[0])}
@@ -215,6 +258,26 @@ def validate(document, chart, *, geometry=True, progress=None, time_range=None, 
     problems.extend(p for p in movement_warnings(document) if time_range is None or time_range[0] <= p['time'] < time_range[1])
     problems.extend(p for p in hand_crossing_warnings(document)
                     if time_range is None or time_range[0] <= p['time'] < time_range[1])
+    problems.extend(p for p in hand_interaction_warnings(document)
+                    if time_range is None or p['time'] < time_range[1] and p['end_time'] > time_range[0])
+    for window in document.baseline.get('diagnostics', {}).get('ribbons', {}).get('windows', ()):
+        motion = window.get('hand_motion')
+        if motion and not motion['valid'] and (time_range is None or
+                window['start'] < time_range[1] and window['end'] >= time_range[0]):
+            ids = sorted({i for nid in window['note_ids'] for i in document.note_contacts.get(nid, ())})
+            problems.append(issue('hand_motion',
+                f"生成时该长条未通过受限手模型检查，最大触点偏差 {motion['max_error_mm']:.1f} mm；"
+                '触控覆盖通过不代表手部能完成，请在同步手部预览中复核或重新规划',
+                ids, window['start'], 'warning'))
+    for window in document.baseline.get('diagnostics',{}).get('ordinary_hand_search',{}).get('windows',()):
+        motion=window.get('final_motion')
+        if motion and not motion['valid'] and (time_range is None or
+                window['start']<time_range[1] and window['end']>=time_range[0]):
+            wanted=motion.get('failed_note_ids') or window['note_ids']
+            ids=sorted({i for nid in wanted for i in document.note_contacts.get(nid,())})
+            problems.append(issue('ordinary_hand_motion',
+                f"普通音符窗口未通过实际手部复核，最大触点偏差 {motion['max_error_mm']:.1f} mm；"
+                '请在同步手部预览中检查，触控覆盖通过不代表手部能完成',ids,window['start'],'warning'))
     if geometry:
         from flowphi.charts.model import NoteType
         from flowphi.planning.contacts import ContactGeometry, validate_contact

@@ -119,8 +119,50 @@ class RibbonTests(unittest.TestCase):
         self.assertTrue(window['fallback'])
         self.assertEqual('baseline', window['selected'])
         self.assertTrue(window['candidates']['baseline']['fallback'])
+        self.assertTrue(window['candidates']['baseline']['valid'])
         self.assertEqual(set(range(5)), {n for c in result['contacts'] for n in c['note_ids']})
         self.assertTrue(checked_report(PlanDocument(result), chart)['valid'])
+
+    def test_incomplete_rescue_is_retained_but_not_reported_valid(self):
+        from unittest import mock
+        from flowphi.planning import ribbons
+        planner = Planner(make_chart([(2, 1.+i*.08, 0., 0.) for i in range(5)]),
+                          self.settings(), default_profile())
+        def unresolved(*args, **kwargs):
+            for task in kwargs['tasks']:
+                kwargs['on_unplanned'](task, {'unavailable': 1})
+            return [State()]
+        with mock.patch.object(ribbons, '_family_candidates', return_value=[]), \
+                mock.patch.object(planner, '_run_plain', side_effect=unresolved):
+            states, report, pending = plan_window(planner, planner.tasks, [State()], lambda *a: None)
+        rescue = report['candidates']['baseline']
+        self.assertFalse(rescue['valid'])
+        self.assertEqual(0, rescue['count'])
+        self.assertEqual(1, rescue['search_states'])
+        self.assertEqual(5, len(pending))
+        self.assertEqual(1, len(states))
+        self.assertEqual((), states[0].contacts)
+
+    def test_fully_covered_but_invalid_rescue_is_not_reported_valid(self):
+        from unittest import mock
+        from flowphi.planning import ribbons
+        planner = Planner(make_chart([(2, 1.+i*.08, 0., 0.) for i in range(5)]),
+                          self.settings(), default_profile())
+        contact = dict(hand='left', finger='index', pointer=0, kind='drag',
+            start=1., end=1.334, note_ids=list(range(5)), joint_note_coverage=True,
+            points=[[1., .99, .99]], decision={'degraded': []})
+        state = State((contact,))
+        with mock.patch.object(ribbons, '_family_candidates', return_value=[]), \
+                mock.patch.object(planner, '_run_plain', return_value=[state]):
+            states, report, pending = plan_window(planner, planner.tasks, [State()], lambda *a: None)
+        self.assertFalse(report['candidates']['baseline']['valid'])
+        self.assertEqual(1, report['candidates']['baseline']['rejections']['incomplete_or_invalid'])
+        # The physical selector now rejects malformed geometry instead of
+        # forwarding it as a fully covered draft. Preserve all unplanned IDs.
+        self.assertEqual(set(range(5)),{t.id for t,_ in pending})
+        self.assertFalse(report['candidates']['baseline']['hand_valid'])
+        self.assertEqual(1, len(states))
+        self.assertEqual((),states[0].contacts)
 
     def test_window_evaluation_does_not_rewrite_input_history(self):
         chart = make_chart([(1, .5, 0., 0.)]+[(2, 1.+i*.1, 0., 0.) for i in range(5)])

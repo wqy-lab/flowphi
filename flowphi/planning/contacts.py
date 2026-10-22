@@ -1,4 +1,5 @@
 from functools import lru_cache
+from collections import OrderedDict
 import cmath
 import math
 
@@ -13,13 +14,15 @@ from flowphi.charts.model import NoteType
 from flowphi.charts.blocks import compose
 from flowphi.motion import point_at
 
+SCREEN_MARGIN = .012
+
 
 class ContactGeometry:
     def __init__(self, chart, mask_size=(196, 110), pad_clearance=.006, boundary_mode='aligned',
                  physical_screen=(.28, .1575), extra_clearance_m=0., cache_judgement=False):
         self.chart = chart
         self.notes = dict(enumerate((line, n) for line in chart.lines for n in line.notes))
-        self.screen = box(.012, .012, .988, .988).difference(
+        self.screen = box(SCREEN_MARGIN, SCREEN_MARGIN, 1-SCREEN_MARGIN, 1-SCREEN_MARGIN).difference(
             box(0, 0, .1, .1).union(box(.9, 0, 1, .1)))
         # Normalized shader noise is in [-.5,.5], along two orthogonal axes.
         # Include a mask texel and an effect texel for quantization/edge dilation.
@@ -36,6 +39,7 @@ class ContactGeometry:
         # A planner owns an immutable chart. Bound caches to this geometry's
         # lifetime; final export validation uses the independent uncached path.
         self.cache_judgement = cache_judgement
+        self._sample_cache = OrderedDict()
         if cache_judgement:
             self._strip_at = lru_cache(maxsize=8192)(self._strip_at)
             self._required_zone = lru_cache(maxsize=4096)(self._required_zone)
@@ -206,6 +210,29 @@ class ContactGeometry:
         return np.array(sorted(ms / 1000 for ms in times if low <= ms <= high))
 
     def sample_zones(self, contact, step=.01, extra_times=()):
+        if not self.cache_judgement:
+            return self._sample_zones(contact, step, extra_times)
+        # Sampling depends on geometry and timing, not finger assignment, seed
+        # positions or endpoint constraints applied later by refine_contact.
+        extra_times = tuple(sorted(extra_times))
+        key = (contact['start'], contact['end'], tuple(contact['note_ids']), step, extra_times,
+               tuple(sorted(contact.get('judgement_times', {}).items())),
+               repr({k: contact.get(k) for k in ('joint_note_coverage', 'joint_note_windows',
+                     'collective_hold', 'refinement_region', 'block_clearance_m')}))
+        cached = self._sample_cache.get(key)
+        if cached is None:
+            times, zones = self._sample_zones(contact, step, extra_times)
+            cached = (times, tuple(zones))
+            self._sample_cache[key] = cached
+            if len(self._sample_cache) > 128:
+                self._sample_cache.popitem(last=False)
+        else:
+            self._sample_cache.move_to_end(key)
+        # Refinement pins endpoints by replacing list entries. Never let one
+        # candidate modify another candidate's cached sample constraints.
+        return cached[0].copy(), list(cached[1])
+
+    def _sample_zones(self, contact, step=.01, extra_times=()):
         """Place keys on milliseconds, constraining adjacent keys at exact edges.
 
         UP happens after the final MOVE's millisecond. Block events can also
@@ -234,10 +261,74 @@ class ContactGeometry:
         return times, [z.buffer(-2e-5) for z in zones]
 
 
+_PROJECTION_INTERIORS = OrderedDict()
+
+
+def _projection_data(zone):
+    """Certified interior box and exact convex edges; complex shapes fall back."""
+    identity = id(zone)
+    cached = _PROJECTION_INTERIORS.get(identity)
+    if cached is not None and cached[0] is zone:
+        _PROJECTION_INTERIORS.move_to_end(identity)
+        return cached[1:]
+    low_x, low_y, high_x, high_y = zone.bounds
+    width, height = high_x-low_x, high_y-low_y
+    interiors = []
+    singleton=tuple(zone.coords[0][:2]) if isinstance(zone,Point) and not zone.is_empty else None
+    if width > 0 and height > 0:
+        bounds_list=[(low_x,low_y,high_x,high_y),
+            (low_x,low_y+height*.1,high_x,high_y),
+            (low_x,low_y,high_x,high_y-height*.1),
+            (low_x+width*.1,low_y,high_x-width*.1,high_y)]
+        bounds_list.extend((low_x+width*inset,low_y+height*inset,high_x-width*inset,high_y-height*inset)
+                           for inset in (.2,.35))
+        for bounds in bounds_list:
+            if zone.covers(box(*bounds)):
+                interiors.append(bounds)
+                if bounds==bounds_list[0]:break
+    segments, orientation = None, 1.
+    if zone.geom_type == 'Polygon' and not zone.interiors and zone.is_valid:
+        vertices = list(zone.exterior.coords)
+        if 4 <= len(vertices) <= 9:
+            edges = [(float(a[0]), float(a[1]), float(b[0]-a[0]), float(b[1]-a[1]))
+                     for a, b in zip(vertices, vertices[1:])]
+            turns = [a[2]*b[3]-a[3]*b[2] for a, b in zip(edges, [*edges[1:], edges[0]])]
+            if (all(t >= 0 for t in turns) or all(t <= 0 for t in turns)) and any(abs(t) > 1e-15 for t in turns):
+                orientation = 1. if any(t > 0 for t in turns) else -1.
+                if all(dx*dx+dy*dy > 1e-20 for _, _, dx, dy in edges):
+                    segments = tuple((*e, e[2]*e[2]+e[3]*e[3], float(b[0]), float(b[1]))
+                                     for e, b in zip(edges, vertices[1:]))
+    _PROJECTION_INTERIORS[identity] = (zone, tuple(interiors), segments, orientation,singleton)
+    if len(_PROJECTION_INTERIORS) > 4096:
+        _PROJECTION_INTERIORS.popitem(last=False)
+    return tuple(interiors), segments, orientation,singleton
+
+
 def project(zone, xy):
-    p = Point(*xy)
-    if zone.covers(p):
+    interiors, segments, orientation,singleton = _projection_data(zone)
+    if singleton is not None:return np.asarray(singleton,dtype=float)
+    for interior in interiors:
+        if interior[0] <= xy[0] <= interior[2] and interior[1] <= xy[1] <= interior[3]:
+            return np.asarray(xy, dtype=float)
+    if segments is not None:
+        x, y = float(xy[0]), float(xy[1])
+        crosses = [orientation*(dx*(y-ay)-dy*(x-ax)) for ax, ay, dx, dy, _, _, _ in segments]
+        if all(value > 1e-12 for value in crosses):
+            return np.asarray(xy, dtype=float)
+        if any(value < -1e-12 for value in crosses):
+            best, distance = None, math.inf
+            for ax, ay, dx, dy, squared, bx, by in segments:
+                u = max(0., min(1., ((x-ax)*dx+(y-ay)*dy)/squared))
+                px, py = (ax, ay) if u == 0 else (bx, by) if u == 1 else (ax+u*dx, ay+u*dy)
+                candidate = (x-px)**2+(y-py)**2
+                if candidate < distance:
+                    best, distance = (px, py), candidate
+            return np.asarray(best, dtype=float)
+    # Same point/region predicate including boundaries, without allocating a
+    # Shapely Point for every interior coordinate-descent step.
+    if shapely.intersects_xy(zone, xy[0], xy[1]):
         return np.asarray(xy, dtype=float)
+    p = Point(*xy)
     q = nearest_points(zone, p)[0]
     return np.array((q.x, q.y))
 

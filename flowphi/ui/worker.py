@@ -21,6 +21,19 @@ def event(message, **values):
     report_progress(stage, message, **values)
 
 
+def planning_progress(done, total, task):
+    detail = f'当前音符 {task.id} · {task.beat / 1000:.3f} s' if task else '全部音符已处理'
+    phrase = getattr(task, 'planning_detail', None)
+    if phrase:
+        names = dict(baseline='逐颗兜底', heads='夹键分配', continuous='连续划动', relay='分段接力', stationary='多指驻点', hand_motion='受限手部评估',hand_repair='手部失败修复',readability='手别与遮挡复核',ordinary_hand='普通音符手部筛选',ordinary_audit='普通音符手部复核')
+        scope = '黄键长条' if phrase['strategy'] in ('baseline', 'heads', 'continuous', 'relay', 'stationary') else '动作窗口'
+        detail = (f'{scope} {phrase["start"]:.3f}–{phrase["end"]:.3f} s · '
+                  f'{names.get(phrase["strategy"], phrase["strategy"])} {phrase["done"]}/{phrase["total"]}')
+        if phrase.get('elapsed_seconds') is not None:
+            detail += f' · 已用 {phrase["elapsed_seconds"]:.1f} s'
+    event('生成指法初稿', stage='plan', done=done, total=total, unit='个音符', detail=detail)
+
+
 def run(command, *, cwd=ROOT, log=None):
     with subprocess.Popen(list(map(str, command)), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding='utf-8', errors='replace', creationflags=NO_WINDOW) as process:
@@ -109,19 +122,15 @@ def execute(request):
             report_log('包内谱面：' + source.reference['chart_entry'])
         report_log(f"分配设置：{len(settings.fingers) * 2} 根手指，每步保留 {settings.beam_width} 个候选")
         event('生成指法初稿', stage='plan')
-        def planning_progress(done, total, task):
-            detail = f'当前音符 {task.id} · {task.beat / 1000:.3f} s' if task else '全部音符已处理'
-            phrase = getattr(task, 'planning_detail', None)
-            if phrase:
-                names = dict(baseline='逐颗兜底', heads='夹键分配', continuous='连续划动', relay='分段接力', stationary='多指驻点')
-                detail = (f'黄键长条 {phrase["start"]:.3f}–{phrase["end"]:.3f} s · '
-                          f'{names[phrase["strategy"]]} {phrase["done"]}/{phrase["total"]} · '
-                          f'已用 {phrase["elapsed_seconds"]:.1f} s')
-            event('生成指法初稿', stage='plan', done=done, total=total, unit='个音符', detail=detail)
         console = Console(force_terminal=False, color_system=None)
+        def checkpoint(motion):
+            document = PlanDocument(motion, chart=source.reference, pose=options.get('pose'),
+                                    title=Path(request['chart']).stem + ' (recovery draft)', copy_baseline=False)
+            write_json_atomic(work / 'recovery.fingering.json', document.snapshot())
         if options.get('keep_unplanned', True):
             from flowphi.ui.generation import generate_draft
-            motion = generate_draft(source.chart, settings, profile, console, progress=planning_progress)
+            motion = generate_draft(source.chart, settings, profile, console, progress=planning_progress,
+                                    checkpoint=checkpoint)
         else:
             _, _, motion = plan(source.chart, console=console, settings=settings, profile=profile, progress=planning_progress)
         document = PlanDocument(motion, chart=source.reference, pose=options.get('pose'),
@@ -132,6 +141,10 @@ def execute(request):
         pending = motion['diagnostics'].get('draft_fallback_notes', [])
         if pending:
             event(f'初稿已保留全部音符；其中 {len(pending)} 个音符需要人工检查，可在“问题”页定位')
+        hand_failed = motion['diagnostics'].get('ribbons', {}).get('hand_motion_failed_windows', 0)
+        hand_failed += motion['diagnostics'].get('ordinary_hand_search',{}).get('final_failed_windows',0)
+        if hand_failed:
+            event(f'其中 {hand_failed} 段黄键长条未通过受限手模型检查，已保留草稿并在“问题”页标记')
         return dict(project=str(project), contacts=len(document), chart=source.reference)
     document, source = load_inputs(request)
     report_log(f"谱面：{source.reference['path']} · {source.reference['note_count']} 个音符 · {len(document)} 段动作")
@@ -270,8 +283,15 @@ def main():
         return 0
     except Exception as exc:
         traceback.print_exc()
-        write_json_atomic(result_path, dict(ok=False, error=str(exc)))
-        report_log(str(exc), 'error')
+        error = str(exc)
+        recovery = Path(request['work']) / 'recovery.fingering.json'
+        result = dict(ok=False, error=error)
+        if request.get('kind') == 'generate' and recovery.is_file():
+            result['recovery_project'] = str(recovery)
+            error += '\n已保存恢复初稿（最终复核未完成）：' + str(recovery)
+            result['error'] = error
+        write_json_atomic(result_path, result)
+        report_log(error, 'error')
         return 1
 
 

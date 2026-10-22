@@ -71,8 +71,9 @@ def assign_pending(contacts, pending, keys):
         assigned.add(i)
 
 
-def generate_draft(chart, settings, profile, console=None, *, progress=None):
+def generate_draft(chart, settings, profile, console=None, *, progress=None, checkpoint=None):
     started = time.monotonic()
+    cpu_started = time.process_time()
     planner = Planner(chart, settings, profile)
     pending = []
 
@@ -94,16 +95,53 @@ def generate_draft(chart, settings, profile, console=None, *, progress=None):
     for c in contacts:
         if c['kind'] != 'flick':
             c['points'] = compact_stationary(c['points'])
-    # Derived motion and PSAP binding are produced only by the export compiler.
-    return dict(version=VERSION, algorithm=5, timebase='chart_seconds', coordinates='normalized_screen',
+    def snapshot():
+        return dict(version=VERSION, algorithm=5, timebase='chart_seconds', coordinates='normalized_screen',
                 contacts=contacts, hand_rest=[], profile=profile, physical_screen=list(planner.physical),
                 settings=vars(settings), palm_motion='v4',
                 diagnostics=dict(notes=len(planner.tasks), contacts=len(contacts),
                     joined_drags=sum(len(c['note_ids']) - 1 for c in contacts),
                     seconds=time.monotonic() - started, rejections=dict(planner.rejected),
-                    draft_fallback_notes=[nid for c in pending for nid in c['note_ids']],
+                    draft_fallback_notes=[nid for c in contacts if c.get('draft_fallback') for nid in c['note_ids']],
+                    spatial_chords=dict(getattr(planner, 'chord_diagnostics', {})),
+                    ordinary_hand_search=getattr(planner,'ordinary_hand_diagnostics',{}),
+                    readability=getattr(planner,'readability_diagnostics',{}),
                     ribbons=getattr(planner, 'ribbon_diagnostics', dict(enabled=False, windows=[])),
                     degraded=[dict(note_ids=c['note_ids'], time=c['start'], reasons=c['decision']['degraded'])
                               for c in contacts if c['decision']['degraded']],
                     finger_usage=dict(Counter(f'{c["hand"]}:{c["finger"]}' for c in contacts)),
                     native_ap_validated=False))
+
+    stages = dict(planning=dict(seconds=time.monotonic()-started,
+                                cpu_seconds=time.process_time()-cpu_started))
+    stage_started = time.monotonic(), time.process_time()
+    def finish_stage(name):
+        nonlocal stage_started
+        now = time.monotonic(), time.process_time()
+        stages[name] = dict(seconds=now[0]-stage_started[0], cpu_seconds=now[1]-stage_started[1])
+        from flowphi.progress import report_log
+        report_log(f'生成阶段 {name}: {stages[name]["seconds"]:.2f} s; CPU {stages[name]["cpu_seconds"]:.2f} s')
+        stage_started = now
+    def save_checkpoint(stage):
+        if checkpoint:
+            draft = snapshot()
+            draft['diagnostics']['generation'] = dict(complete=False, stage=stage, stages=dict(stages))
+            checkpoint(draft)
+
+    save_checkpoint('contacts_planned')
+    from flowphi.planning.ribbons import audit_hand_motion
+    if settings.hand_motion_repair and settings.occlusion_weight:
+        from flowphi.planning.readability import repair_readability
+        repair_readability(planner,contacts,progress)
+    finish_stage('readability')
+    save_checkpoint('readability_complete')
+    audit_hand_motion(planner, contacts, progress)
+    finish_stage('ribbon_audit_and_repair')
+    from flowphi.planning.physical_plain import audit_ordinary
+    save_checkpoint('ribbon_audit_complete')
+    audit_ordinary(planner,contacts,progress)
+    finish_stage('ordinary_audit')
+    # Derived motion and PSAP binding are produced only by the export compiler.
+    draft = snapshot()
+    draft['diagnostics']['generation'] = dict(complete=True, stage='complete', stages=stages)
+    return draft

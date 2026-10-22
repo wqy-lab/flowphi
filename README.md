@@ -7,6 +7,7 @@
   - **FFmpeg 和 FFprobe**
   - **手部骨骼模型**
     - 可到[BlendSwap](https://blendswap.com/blend/22269)下载
+    - 也支持免费的 [MOD HandRigs](https://mightbemod.itch.io/simple-blender-hand-models)，先按[环境说明](docs/environment-setup.md)转换为项目兼容模型。
   - **游戏资源包**
 
 ## 从源码运行

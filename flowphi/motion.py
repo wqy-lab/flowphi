@@ -80,11 +80,18 @@ def stroke_lift(following, gap, job):
         density = smooth((.22 - gap) / .16)
         # Bound the planned stroke before solving, so a short gap cannot leave
         # the wrist chasing a peak or snapping down at the next contact.
-        speed = job.get('palm_strike_speed', .9)
+        speed = min(job.get('palm_strike_speed', .9), job.get('wrist_speed', .9))
         ratio = max(.01, job.get('palm_lift_ratio', .70))
         low = job.get('palm_lift_low', .030)
         high = job.get('palm_lift_high', .032)
-        return factor * min(job.get('lift_height', .034), low + (high - low) * density, speed * gap / (math.pi * ratio))
+        # sin² has a compressed downstroke: its derivative is NOT just pi.
+        # Reserve the same 3D wrist-speed budget for the lateral transfer first.
+        peak = min(.99,max(.01,job.get('stroke_peak_phase',.62)))
+        derivative = math.pi/(2*min(peak,1-peak))
+        lateral = 1.25*job.get('stroke_distance_m',0.)/max(1e-9,gap)
+        vertical = math.sqrt(max(0.,speed*speed-lateral*lateral))
+        available = max(.0012,vertical*gap/(derivative*ratio))
+        return factor * min(job.get('lift_height', .034), low + (high - low) * density, available)
     if job.get('palm_lift_mode') == 'accent':
         density = smooth((.22 - gap) / .16)
         return factor * min(job.get('lift_height', .056), .040 + .014 * density)
@@ -225,7 +232,7 @@ def finger_pose(events, t, rest, job, key=None):
         side = -1 if following['hand'] == 'left' else 1
         xy = (xy[0] + side * sway * stroke_shape(u, job), xy[1])
         # One continuous local stroke, with exact release and landing boundaries.
-        lift = stroke_lift(following, gap, job)
+        lift = stroke_lift(following, gap, dict(job,stroke_distance_m=math.dist(a,b)))
         if job.get('finger_motion') == 'whole_finger':
             # Leave the surface promptly, retain a readable raised phase, then
             # return before the next DOWN. Contact times remain unchanged.
@@ -330,7 +337,8 @@ def wrist_pose(contacts, rests, side, t, job, offsets, neutral_offsets=None, ind
             following = next((c for c in events if c['start'] >= gap['end'] - 1e-7), None)
             duration = gap['end'] - gap['start']
             if job.get('palm_lift_ratio') is not None and following and duration <= job.get('stroke_gap_limit', .75):
-                lift = stroke_lift(following, duration, job) * job['palm_lift_ratio']
+                lift = stroke_lift(following, duration, dict(job,
+                    stroke_distance_m=math.dist(a[1:3],b[1:3]))) * job['palm_lift_ratio']
                 if job.get('palm_lift_mode') not in ('accent', 'gentle'):
                     # Legacy restrained mode reserves speed for XY movement.
                     lift = min(lift, .8 * job.get('wrist_speed', .9) * .28 * duration / 1.875)

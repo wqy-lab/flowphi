@@ -794,13 +794,17 @@ class PoseCanvas(QWidget):
                 painter.setBrush(QColor('#1b3044'))
                 for point in points[:-1]:
                     painter.drawEllipse(point, 2.8, 2.8)
-                painter.setBrush(QColor('#86e4ae') if finger_data['down'] else color)
+                contact_color = QColor('#fa8b86' if finger_data['error'] > .001 else '#86e4ae')
+                painter.setBrush(contact_color if finger_data['down'] else color)
                 painter.drawEllipse(points[-1], 5., 5.)
                 if finger_data['down']:
                     target = self.project(finger_data['target'])
-                    painter.setPen(QPen(QColor('#86e4ae'), 1))
+                    painter.setPen(QPen(contact_color, 1))
                     painter.setBrush(Qt.NoBrush)
                     painter.drawEllipse(target, 9., 9.)
+                    if finger_data['error'] > .001:
+                        painter.setPen(QPen(contact_color, 1, Qt.DashLine))
+                        painter.drawLine(points[-1], target)
             if data['correction'] > .0001:
                 requested = self.project(data['requested'])
                 painter.setPen(QPen(QColor('#f8c56d'), 1.5, Qt.DashLine))
@@ -823,12 +827,12 @@ class PoseCanvas(QWidget):
             count = sum(f['down'] for f in data['fingers'].values())
             feedback = f'{HAND_NAMES[hand]} · {count} 根手指接触中'
             if data['correction'] > .0001:
-                feedback += f" · 为保持接触，手腕已修正 {data['correction'] * 1000:.1f} mm（黄叉为设定位置）"
+                feedback += f" · 运动约束后手腕偏移 {data['correction'] * 1000:.1f} mm（黄叉为设定位置）"
             if data['reach_error'] > .001:
-                feedback += f" · 仍超出可达范围 {data['reach_error'] * 1000:.1f} mm，请减小手腕偏移或倾斜角度"
+                feedback += f" · 触点偏差 {data['reach_error'] * 1000:.1f} mm，请调整指法或手腕姿态"
         else:
             finger_data = data['fingers'][target]
-            feedback = f'{HAND_NAMES[hand]}{NAMES[target]} · ' + ('接触中，指尖跟随触控轨迹' if finger_data['down'] else
+            feedback = f'{HAND_NAMES[hand]}{NAMES[target]} · ' + ((f"应接触，偏差 {finger_data['error']*1000:.1f} mm" if finger_data['error'] > .001 else '接触中，指尖跟随触控轨迹') if finger_data['down'] else
                 ('空闲，可调整弯曲、张合和抬起' if finger_data['idle'] >= .999 else '正在衔接触控动作，空闲姿态逐渐过渡'))
         if frame['warning']:
             feedback += ' · ' + frame['warning']

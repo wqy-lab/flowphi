@@ -12,6 +12,7 @@ from flowphi.motion import MotionIndex, finger_pose, palm_offsets, point_at, str
 from flowphi.pose import (PoseSampler, contact_reach, finger_deltas, finger_planes, fit_wrist,
                          frame_values, idle_weight, motion_style, rotation_matrix, wrist_constraints)
 from flowphi.runtime import NO_WINDOW
+from flowphi import hand_limits as limits
 
 FINGERS = {
     'index': ('Bone', 'Bone.001', 'Bone.002'),
@@ -28,15 +29,24 @@ def solve_steps(limit=6):
 
 
 def bake_rotations(rigs, baked):
-    """Write solved joint curves in bulk instead of repeatedly inserting/sorting individual keys."""
+    """Bake flex/spread angles, so subframes cannot reintroduce axial twist.
+
+    The supported rig's local X is flexion, local Z is root spread. References
+    have only X/Z rotation. Distal Z and every local Y stay constant.
+    """
+    from mathutils import Quaternion
     for index, ((side, name), keys) in enumerate(baked.items(), 1):
         bone = rigs[side].pose.bones[name]
-        bone.rotation_mode = 'QUATERNION'
+        bone.rotation_mode = 'XYZ'
         # Blender stores frame coordinates as float32; merge event/video samples that become the same frame.
-        values = dict(zip(array('f', (frame for frame, _ in keys)), (q for _, q in keys)))
+        values = dict(zip(array('f', (frame for frame, _ in keys)),
+                          (tuple(Quaternion(q).to_euler('XYZ')) for _, q in keys)))
         action = rigs[side].animation_data.action
-        path = bone.path_from_id('rotation_quaternion')
-        for component in range(4):
+        path = bone.path_from_id('rotation_euler')
+        for curve in list(action.fcurves):
+            if curve.data_path == bone.path_from_id('rotation_quaternion'):
+                action.fcurves.remove(curve)
+        for component in range(3):
             curve = action.fcurves.find(path, index=component)
             if curve is not None:
                 action.fcurves.remove(curve)
@@ -46,7 +56,33 @@ def bake_rotations(rigs, baked):
             for point in curve.keyframe_points:
                 point.interpolation = 'LINEAR'
             curve.update()
+        if hasattr(action, 'slots') and action.slots:
+            rigs[side].animation_data.action_slot = action.slots[0]
         print(f'HANDCAM_STATUS Baking joints {index}/{len(baked)}', flush=True)
+
+
+def bake_object_transforms(objects, samples):
+    """Write object curves once; avoid re-sorting long actions at every sample."""
+    import bpy
+    for obj in objects:
+        obj.animation_data_create()
+        if obj.animation_data.action is None:
+            obj.animation_data.action = bpy.data.actions.new(obj.name + ' motion')
+        action = obj.animation_data.action
+        for path, keys in samples[obj.name].items():
+            values = dict(zip(array('f', (frame for frame, _ in keys)), (v for _, v in keys)))
+            if not values:
+                continue
+            for component in range(len(next(iter(values.values())))):
+                curve = action.fcurves.new(path, index=component)
+                curve.keyframe_points.add(len(values))
+                curve.keyframe_points.foreach_set('co', [x for frame, v in values.items() for x in (frame, v[component])])
+                for point in curve.keyframe_points:
+                    point.interpolation = 'LINEAR'
+                curve.update()
+        # New actions in Blender 4.5 need an explicitly bound slot.
+        if len(action.slots):
+            obj.animation_data.action_slot = action.slots[0]
 
 
 def smooth(u):
@@ -86,6 +122,17 @@ def sample_times(job):
     begin = (first_frame - warmup_frames) / job['fps'] if grid_aligned else start - warmup_frames / job['fps']
     times = {(first_frame + i) / job['fps'] if grid_aligned else start + i / job['fps']
              for i in range(-warmup_frames, job['frames'])}
+    if job.get('preview_sampling', False):
+        # Draft mode samples the delivered frames plus touch and pose boundaries.
+        # It keeps the original trajectories intact; it is not a skin/contact audit.
+        for contact in job['contacts']:
+            times.update(t for t in (contact['start'], contact['end'], contact.get('beat', contact['start']),
+                contact.get('prepare', contact['start']), contact.get('release_until', contact['end']))
+                if begin <= t <= end)
+        sampler = PoseSampler(job.get('pose'))
+        times.update(t + job.get('pose_time_offset', 0.) for t in sampler.key_times
+                     if begin <= t + job.get('pose_time_offset', 0.) <= end)
+        return sorted({round(t, 9) for t in times})
     phases = (.14, .25, .28, .5, .68, .75, .84) if job.get('palm_lift_mode') in ('accent', 'gentle') else (.14, .28, .5, .68, .84)
     phases = sorted({*phases, job.get('stroke_peak_phase', .62)})
     contract_times = set()
@@ -358,6 +405,11 @@ def screen_rect(job):
 def configure_camera(scene, job):
     """Keep the screen plane aligned while letting raised hands approach the lens."""
     camera = scene.camera
+    if camera is None:
+        import bpy
+        camera = bpy.data.objects.new('FlowPhi camera', bpy.data.cameras.new('FlowPhi camera'))
+        scene.collection.objects.link(camera)
+        scene.camera = camera
     camera.rotation_euler = (0, 0, 0)
     camera.data.shift_x = camera.data.shift_y = 0
     camera.data.sensor_fit = 'HORIZONTAL'
@@ -459,7 +511,7 @@ def main(job):
     scene = bpy.context.scene
     use_thumb = job.get('enable_thumb', False)
     planned_pose = bool(job.get('motion_plan_version') or job.get('profile_only'))
-    limit_render_speed = job.get('render_speed_limits', False)
+    limit_render_speed = True  # Contact fitting must never bypass physical output limits.
     out = Path(job['output'])
     (out / 'hands').mkdir(exist_ok=True)
     (out / 'inspection').mkdir(exist_ok=True)
@@ -743,6 +795,14 @@ def main(job):
     contact_root_heights = {}
     relaxed_rotations = {key: [rigs[key[0]].pose.bones[name].rotation_euler.copy() for name in FINGERS[key[1]]]
                          for key in tracks}
+    joint_reference = {(key[0], name): tuple(angles.to_quaternion())
+                       for key, angles_list in relaxed_rotations.items()
+                       for name, angles in zip(FINGERS[key[1]], angles_list)}
+    joint_models = {(key[0], name): limits.joint_model(key[1], joint,
+                        spread_axis=limits.apply(limits.conjugate(joint_reference[key[0], name]), (0., 0., 1.)))
+                    for key in tracks for joint, name in enumerate(FINGERS[key[1]])}
+    previous_joint_rotations = dict(joint_reference)
+    previous_wrist_rotations = {side: tuple(arm.rotation_euler.to_quaternion()) for side, arm in rigs.items()}
     assignments = [{'hand': 'left' if k[0] == -1 else 'right', 'finger': k[1],
                     'pointer': c['pointer'], 'start': c['start'], 'end': c['end']}
                    for k, events in tracks.items() for c in events]
@@ -790,19 +850,28 @@ def main(job):
     collision_corrections = 0
     baked = {(side, name): [] for side in rigs for finger, chain in FINGERS.items()
              if finger != 'thumb' or use_thumb for name in chain}
+    bulk_transforms = job.get('bake_bulk_transforms', False)
+    object_samples = {obj.name: {'location': [], **({'rotation_quaternion': []} if obj in rigs.values() else {})}
+                      for obj in (*rigs.values(), *targets.values())}
     if avoidance:
         baked.update({key: [] for key in palm_bones})
     max_error, contact_samples = 0., 0
     min_clearance, mesh_samples = math.inf, 0
     # Warm up before the clip so a contact already on screen starts in the correct pose.
     previous_time = job['start'] - round(job.get('warmup', 1.) * job['fps']) / job['fps'] - 1 / job['fps']
-    motion_stats = dict(render_speed_limits=limit_render_speed, wrist_speed_clamps=0, max_wrist_lateral_speed_mps=0.)
+    motion_stats = dict(render_speed_limits=True, wrist_speed_clamps=0, max_wrist_lateral_speed_mps=0.,
+                        max_wrist_speed_mps=0., max_wrist_turn_speed_radps=0.,
+                        max_mcp_speed_radps=0., max_distal_speed_radps=0.,
+                        max_distal_excursion_rad=0., joint_clamps=0,
+                        anatomy_model=limits.ANATOMY_MODEL, max_mcp_spread_rad=0.)
     last_progress = 0
     for t in sample_times(motion_job):
         dt = t - previous_time
         previous_time = t
         motion_job['pose_frame'] = pose_sampler.frame(t - job.get('pose_time_offset', 0.))
         previous_output_roots = {side: root.copy() for side, root in roots.items()}
+        for arm in rigs.values():
+            arm.rotation_mode = 'XYZ'
         frame = (t - job['start']) * job['fps'] + 1
         video_frame = round(frame)
         is_video_frame = abs(frame - video_frame) < .00001 and 1 <= video_frame <= job['frames']
@@ -896,8 +965,8 @@ def main(job):
                     if len(pose_stats['samples']) < 100:
                         pose_stats['samples'].append(dict(time=t, hand='left' if side == -1 else 'right',
                             requested=list(requested_root), applied=list(roots[side]), reach_error_mm=residual * 1000))
-            # Authored motion owns the timing. A speed cap applied after reach
-            # projection can pull the wrist out of reach of an active contact.
+            # Preliminary cap improves IK convergence; the final cap below also
+            # constrains collision corrections and reports unreachable contacts.
             if job.get('motion_plan_version') and limit_render_speed:
                 delta = roots[side] - previous_root
                 maximum = job.get('wrist_speed', .9) * max(0., dt)
@@ -1064,30 +1133,6 @@ def main(job):
                 lambda: hand_collisions(rigs, collider_templates, margin=job.get('avoidance_clearance', 0.)),
                 lambda values: fit_skin(values, range(3)), mesh_clearance, job['hand_scale'] / .27)
             collision_corrections += corrections
-        # Retain the old capped mode only for an explicitly requested render.
-        # Normal exports must not undo contact fitting to enforce planner speeds.
-        bounded = False
-        for side, arm in rigs.items():
-            delta = roots[side] - previous_output_roots[side]
-            lateral = Vector((delta.x, delta.y, 0.))
-            maximum = job.get('wrist_speed', .55) * max(0., dt)
-            if limit_render_speed and lateral.length > maximum + 1e-9:
-                wanted = lateral * (maximum / lateral.length)
-                shift = wanted - lateral
-                arm.location += shift
-                roots[side] += shift
-                for key, (pos, weight, down) in list(samples.items()):
-                    if key[0] == side and not down:
-                        samples[key] = (Vector(pos) + shift, weight, down)
-                        targets[key].location += shift
-                motion_stats['wrist_speed_clamps'] += 1
-                bounded = True
-            if dt > 0:
-                actual = roots[side] - previous_output_roots[side]
-                motion_stats['max_wrist_lateral_speed_mps'] = max(
-                    motion_stats['max_wrist_lateral_speed_mps'], math.hypot(actual.x, actual.y) / dt)
-        if bounded:
-            pads = fit_skin(samples, range(4))
         pads = clear_airborne_skin(samples, pads, t)
         for _ in range(0 if avoidance else (3 if job.get('motion_plan_version') else 2)):
             collisions = hand_collisions(rigs, collider_templates)
@@ -1120,6 +1165,66 @@ def main(job):
                     break
                 pads = skin_pads(meshes, pad_indices)
                 pads = clear_airborne_skin(samples, pads, t)
+        # Final, shared physical constraints. Nothing may refit contacts or move
+        # wrists after this point. Missed contacts are measured below as errors.
+        desired_joints = {}
+        for key in tracks:
+            arm = rigs[key[0]]
+            for joint, name in enumerate(FINGERS[key[1]]):
+                bone = arm.pose.bones[name]
+                basis = bone.bone.convert_local_to_pose(bone.matrix, bone.bone.matrix_local,
+                    parent_matrix=bone.parent.matrix, parent_matrix_local=bone.parent.bone.matrix_local, invert=True)
+                desired_joints[key[0], name] = (joint, tuple(basis.to_quaternion()))
+        for key in tracks:
+            rigs[key[0]].pose.bones[FINGERS[key[1]][-1]].constraints[0].influence = 0.
+        from mathutils import Quaternion
+        for (side, name), (joint, desired) in desired_joints.items():
+            previous = previous_joint_rotations[side, name]
+            reference = joint_reference[side, name]
+            limited = limits.joint_rotation(previous, desired, reference, joint, dt, joint_models[side, name])
+            if joint == 0:
+                spread = abs(limits.joint_angles(limited, reference, joint_models[side, name])[1])
+                motion_stats['max_mcp_spread_rad'] = max(motion_stats['max_mcp_spread_rad'], spread)
+            if limits.angular_distance(limited, desired) > 1e-6:
+                motion_stats['joint_clamps'] += 1
+            metric = 'max_mcp_speed_radps' if joint == 0 else 'max_distal_speed_radps'
+            motion_stats[metric] = max(motion_stats[metric], limits.angular_distance(previous, limited) / max(dt, 1e-12))
+            if joint:
+                motion_stats['max_distal_excursion_rad'] = max(motion_stats['max_distal_excursion_rad'],
+                                                              limits.angular_distance(reference, limited))
+            bone = rigs[side].pose.bones[name]
+            bone.rotation_euler = Quaternion(limited).to_euler('XYZ', bone.rotation_euler)
+            previous_joint_rotations[side, name] = limited
+        wanted_roots = {}
+        for side, arm in rigs.items():
+            # The rig origin is offset from the anatomical wrist. Rotating the
+            # object in place would otherwise move the wrist around that origin.
+            desired_root = arm.matrix_world @ arm.data.bones['Bone.016'].head_local
+            wanted_roots[side] = Vector(limits.bounded_position(previous_output_roots[side], desired_root,
+                                                                job.get('wrist_speed', limits.WRIST_SPEED), dt))
+            desired = tuple(arm.rotation_euler.to_quaternion())
+            previous = previous_wrist_rotations[side]
+            limited = limits.bounded_rotation(previous, desired, limits.WRIST_TURN_SPEED, dt)
+            arm.rotation_mode = 'QUATERNION'
+            arm.rotation_quaternion = limited
+            previous_wrist_rotations[side] = limited
+            motion_stats['max_wrist_turn_speed_radps'] = max(motion_stats['max_wrist_turn_speed_radps'],
+                limits.angular_distance(previous, limited) / max(dt, 1e-12))
+        bpy.context.view_layer.update()
+        for side, arm in rigs.items():
+            wanted = wanted_roots[side]
+            actual_root = arm.matrix_world @ arm.data.bones['Bone.016'].head_local
+            shift = wanted - actual_root
+            if shift.length > 1e-9:
+                motion_stats['wrist_speed_clamps'] += 1
+            arm.location += shift
+            roots[side] = wanted
+            actual = wanted - previous_output_roots[side]
+            motion_stats['max_wrist_speed_mps'] = max(motion_stats['max_wrist_speed_mps'], actual.length / max(dt, 1e-12))
+            motion_stats['max_wrist_lateral_speed_mps'] = max(motion_stats['max_wrist_lateral_speed_mps'],
+                                                             math.hypot(actual.x, actual.y) / max(dt, 1e-12))
+        bpy.context.view_layer.update()
+        pads = skin_pads(meshes, pad_indices)
         if job.get('finger_motion') == 'whole_finger':
             for key, (_, _, down) in samples.items():
                 if not down:
@@ -1134,14 +1239,21 @@ def main(job):
                 contact_root_heights[key] = roots[key[0]].z
         if frame >= 1:
             for arm in rigs.values():
-                arm.keyframe_insert('location', frame=frame)
-                arm.keyframe_insert('rotation_euler', frame=frame)
+                if bulk_transforms:
+                    object_samples[arm.name]['location'].append((frame, tuple(arm.location)))
+                    object_samples[arm.name]['rotation_quaternion'].append((frame, tuple(arm.rotation_quaternion)))
+                else:
+                    arm.keyframe_insert('location', frame=frame)
+                    arm.keyframe_insert('rotation_quaternion', frame=frame)
         previous_down = {key for key, value in samples.items() if value[2]}
         for key, pad in pads.items():
             arm = rigs[key[0]]
             pad_offsets[key] = pad - arm.matrix_world @ arm.pose.bones[FINGERS[key[1]][-1]].tail
             if frame >= 1:
-                targets[key].keyframe_insert('location', frame=frame)
+                if bulk_transforms:
+                    object_samples[targets[key].name]['location'].append((frame, tuple(targets[key].location)))
+                else:
+                    targets[key].keyframe_insert('location', frame=frame)
         if frame < 1:
             continue
         for (side, name), keys in baked.items():
@@ -1211,6 +1323,8 @@ def main(job):
             for constraint in list(bone.constraints):
                 if constraint.type == 'IK':
                     bone.constraints.remove(constraint)
+    if bulk_transforms:
+        bake_object_transforms((*rigs.values(), *targets.values()), object_samples)
     bake_rotations(rigs, baked)
     restore_static_geometry(static_geometry)
     for obj in (*rigs.values(), *targets.values()):

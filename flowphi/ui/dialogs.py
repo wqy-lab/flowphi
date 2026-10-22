@@ -415,6 +415,16 @@ class GenerateDialog(QDialog):
         self.ribbons.setChecked(settings.get('drag_ribbon_planning', True))
         self.ribbons.setToolTip('比较连划、分段接力和多指驻点，结合夹键择优；效果优先，生成可能更慢')
         form.addRow('', self.ribbons)
+        self.hand_repair = QCheckBox('手部可行性筛选与失败修复')
+        self.hand_repair.setChecked(settings.get('hand_motion_repair',True))
+        self.hand_repair.setToolTip('先筛选真实手部可行的打法，失败时再比较红黄接续、黄键交接和手别调整。保持判定、手腕和关节硬限制，会增加生成时间。')
+        form.addRow('',self.hand_repair)
+        self.occlusion = spin(settings.get('occlusion_weight', 4.), 0., 20., 1)
+        self.occlusion.setToolTip('优先避开未来约 0.65 秒内的可见音符和长按条；数值越大越重视遮挡，0 关闭。不会放宽判定或手部硬约束。')
+        form.addRow('避免遮挡音符', self.occlusion)
+        self.line_preference = spin(settings.get('judge_line_weight',6.),0.,20.,1)
+        self.line_preference.setToolTip('偏好靠近判定线的落点；仍允许整条垂直判定带，不改变判定范围或手部硬限制。')
+        form.addRow('靠近判定线',self.line_preference)
         self.beam = spin(settings.get('solver_beam', 8), 1, 32)
         self.beam.setToolTip('算法每一步保留多少种分配方案继续尝试数值越大，通常越慢；不保证一定能找到结果')
         form.addRow('每步保留方案数', self.beam)
@@ -433,6 +443,9 @@ class GenerateDialog(QDialog):
                     settings=dict(fingers=self.fingers.currentData(), fingering_objective=self.mode.currentData(),
                                   speed_limits=self.speed.isChecked(), judgement_windows=self.windows.isChecked(),
                                   drag_ribbon_planning=self.ribbons.isChecked(),
+                                  hand_motion_repair=self.hand_repair.isChecked(),
+                                  occlusion_weight=self.occlusion.value(),
+                                  judge_line_weight=self.line_preference.value(),
                                   beam_width=self.beam.value(), candidates_per_finger=self.candidates.value()))
 
 

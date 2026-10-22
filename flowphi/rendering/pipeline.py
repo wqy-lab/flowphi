@@ -446,7 +446,7 @@ def main(argv=None):
                        camera_projection='perspective' if motion_plan.get('palm_motion') == 'v4' else 'orthographic',
                        camera_height=.65,
                        camera_offset_y=-.15,
-                       enable_thumb=True, pose_avoidance=True, render_speed_limits=False,
+                       enable_thumb=True, pose_avoidance=True, render_speed_limits=True,
                        avoidance_clearance=0., airborne_order_clearance=.003,
                        wrist_speed=motion_plan['settings']['wrist_speed'])
             job['pose'] = copy.deepcopy(motion_plan.get('pose'))

@@ -876,7 +876,7 @@ class EditorWindow(QMainWindow):
         for key in ('model', 'blender'):
             self.settings.setValue(key, options[key])
         self.settings.setValue('generator_fingers', ['index', 'index_middle', 'all'][dialog.fingers.currentIndex()])
-        for key in ('fingering_objective', 'speed_limits', 'judgement_windows', 'drag_ribbon_planning'):
+        for key in ('fingering_objective', 'speed_limits', 'judgement_windows', 'drag_ribbon_planning', 'occlusion_weight', 'judge_line_weight', 'hand_motion_repair'):
             self.settings.setValue(key, options['settings'][key])
         self.settings.setValue('solver_beam', options['settings']['beam_width'])
         self.settings.setValue('solver_candidates', options['settings']['candidates_per_finger'])
